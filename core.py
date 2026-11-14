@@ -239,6 +239,45 @@ class Replayer(threading.Thread):
         return self._stop.is_set()
 
 
+# ---------- 连点线程 ----------
+class ClickerThread(threading.Thread):
+    """
+    独立后台连点线程(替代 GUI 线程里的 QTimer):
+    - 不依赖 Qt 事件循环, 界面失焦/弹窗/菜单/系统节流时点击不中断
+    - fire: 执行一次输入的回调; interval_fn: 返回下一次间隔(秒)
+    """
+
+    def __init__(self, fire, interval_fn, on_done=None):
+        super().__init__(daemon=True)
+        self.fire = fire
+        self.interval_fn = interval_fn
+        self.on_done = on_done
+        self._stop = threading.Event()
+
+    def run(self):
+        try:
+            while not self._stop.is_set():
+                interval = max(0.005, float(self.interval_fn()))
+                end = time.perf_counter() + interval
+                while time.perf_counter() < end:
+                    if self._stop.is_set():
+                        return
+                    time.sleep(min(0.005, max(0.0, end - time.perf_counter())))
+                if self._stop.is_set():
+                    return
+                self.fire()
+        finally:
+            if self.on_done:
+                self.on_done()
+
+    def stop(self):
+        self._stop.set()
+
+    @property
+    def stopped(self):
+        return self._stop.is_set()
+
+
 # ---------- 自定义序列执行器 ----------
 class SequencePlayer(threading.Thread):
     """

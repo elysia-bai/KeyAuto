@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-main.py - 按键输入自动化工具 (KeyAuto)  v1.2
+main.py - 按键输入自动化工具 (KeyAuto)  v1.3
 交互形态: 主界面选择功能 -> 主界面隐藏 -> 悬浮窗设置并运行
 悬浮窗右键 -> 返回主界面 / 急停 / 保存配置 / 退出
 
-v1.2 变更:
-  1. 序列编辑器改为非模态: 打开时悬浮窗仍可拖动/操作
-  2. 序列编辑改为"圆圈"模式: 空白圆点击录入按键, 圆内显示按键;
-     新动作的属性(坐标/时长/延时/鼠标按钮)同步出现在悬浮窗, 可即时修改;
-     添加先后顺序即执行顺序
-  3. 录制器过滤开始/结束热键, 热键不再被录进事件流
+v1.3 变更:
+  1. 连点面板删除"拾取坐标", 只保留跟随鼠标模式
+  2. 按键捕获框恢复"确定/取消"按钮; 修复跨线程定时器失效导致的卡死
+  3. 悬浮窗"动作属性"栏新增"用鼠标点选 X/Y"定位
+  4. 改热键后提示文字实时刷新(保存设置时 + 每次显示面板时双重刷新)
+  5. 连点引擎从 GUI 线程 QTimer 迁移到独立后台线程(ClickerThread),
+     点击其他程序/界面失焦/弹窗时连点不中断
 
-v1.1 修复: 全局浅色主题; 悬浮窗标题栏拖动; 高度自适应防重叠; 屏幕圆圈拾取; 热键文字同步
+v1.2: 编辑器非模态化; 序列圆圈模式; 录制热键过滤
+v1.1: 全局浅色主题; 悬浮窗标题栏拖动; 高度自适应; 热键文字同步
 """
 import sys
 import time
@@ -29,7 +31,8 @@ from PySide6.QtWidgets import (
 )
 
 import core
-from core import Recorder, Replayer, SequencePlayer, perform_input, random_interval_ms
+from core import (Recorder, Replayer, SequencePlayer, perform_input,
+                  random_interval_ms, ClickerThread)
 
 # 应用目录: 打包成 onefile exe 后 __file__ 指向临时解压目录, 数据须落在 exe 旁边
 if getattr(sys, "frozen", False):
@@ -162,13 +165,21 @@ class GlobalHotkeys(QWidget):
 # 按键捕获对话框
 # ============================================================
 class CaptureKeyDialog(QDialog):
+    """
+    按下按键 -> 显示按键名 -> 点击"确定"完成绑定(可反复按其他键改选)。
+    pynput 监听回调在后台线程, 通过 Qt 信号(队列投递)回到 GUI 线程更新界面;
+    之前在后台线程直接调 QTimer.singleShot(self.accept) 不会触发, 导致对话框卡死。
+    """
+    keyCaptured = Signal(object)  # 键数据字典; None 表示按了 Esc 取消
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("捕获按键")
         self.setFixedWidth(320)
         self.captured = None
+        self._listener = None
         lay = QVBoxLayout(self)
-        tip = QLabel("请按下要录入的按键…（Esc 取消）")
+        tip = QLabel("请按下要录入的按键，然后点击\"确定\"（Esc 取消）")
         tip.setWordWrap(True)
         self.show_label = QLabel("等待输入…")
         self.show_label.setAlignment(Qt.AlignCenter)
@@ -178,7 +189,24 @@ class CaptureKeyDialog(QDialog):
         lay.addWidget(tip)
         lay.addWidget(self.show_label)
 
-        self._listener = None
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.ok_btn = QPushButton("确定")
+        self.ok_btn.setEnabled(False)
+        self.ok_btn.setDefault(True)
+        self.ok_btn.setMinimumHeight(32)
+        self.ok_btn.setStyleSheet(
+            "QPushButton{background:#2e7d32;color:#ffffff;border:none;border-radius:5px;font-weight:bold;}"
+            "QPushButton:disabled{background:#b0bec5;}")
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setMinimumHeight(32)
+        row.addWidget(self.ok_btn)
+        row.addWidget(cancel_btn)
+        lay.addLayout(row)
+        self.ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+
+        self.keyCaptured.connect(self._on_key)
         self._start_capture()
 
     def _start_capture(self):
@@ -186,18 +214,25 @@ class CaptureKeyDialog(QDialog):
 
         def on_press(key):
             if key == pkb.Key.esc:
-                QTimer.singleShot(0, self.reject)
+                self.keyCaptured.emit(None)
                 return False
             s = core.serialize_key(key)
             if s:
-                self.captured = s
-                self.show_label.setText(core.key_display_name(s))
-                QTimer.singleShot(0, self.accept)
-                return False
-            return True
+                self.keyCaptured.emit(s)
+            return True  # 继续监听, 允许改按其他键
 
         self._listener = pkb.Listener(on_press=on_press)
         self._listener.start()
+
+    def _on_key(self, data):
+        # GUI 线程槽: 信号已由 Qt 自动队列投递
+        if data is None:
+            self.reject()
+            return
+        self.captured = data
+        self.show_label.setText(core.key_display_name(data))
+        self.ok_btn.setEnabled(True)
+        self.ok_btn.setFocus()
 
     def done(self, r):
         if self._listener:
@@ -205,6 +240,7 @@ class CaptureKeyDialog(QDialog):
                 self._listener.stop()
             except Exception:
                 pass
+            self._listener = None
         super().done(r)
 
 
@@ -298,18 +334,16 @@ class CoordinateOverlay(QWidget):
 
 
 # ============================================================
-# 连点面板 (定频 / 随机 共用)
+# 连点面板 (定频 / 随机 共用) — 只支持跟随鼠标, 后台线程点击
 # ============================================================
 class ClickPanel(QWidget):
     def __init__(self, app_ctx, random_mode=False):
         super().__init__()
         self.ctx = app_ctx
         self.random_mode = random_mode
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._tick)
+        self.clicker = None  # ClickerThread
         self.running = False
         self.key_dict = None
-        self._pick_overlay = None
 
         lay = QGridLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
@@ -356,29 +390,9 @@ class ClickPanel(QWidget):
             lay.addWidget(self.rate, row, 1)
             row += 1
 
-        pos_group = QGroupBox("点击位置")
-        pl = QVBoxLayout(pos_group)
-        pl.setContentsMargins(10, 14, 10, 8)
-        pl.setSpacing(6)
-        self.radio_follow = QRadioButton("跟随当前鼠标")
-        self.radio_fixed = QRadioButton("固定坐标")
-        bg = QButtonGroup(self)
-        bg.addButton(self.radio_follow)
-        bg.addButton(self.radio_fixed)
-        pl.addWidget(self.radio_follow)
-        pl.addWidget(self.radio_fixed)
-        pick_row = QHBoxLayout()
-        self.pick_btn = QPushButton("拾取坐标")
-        self.pick_btn.clicked.connect(self._pick_pos)
-        self.pos_label = QLabel("X:-  Y:-")
-        pick_row.addWidget(self.pick_btn)
-        pick_row.addWidget(self.pos_label)
-        pick_row.addStretch(1)
-        pl.addLayout(pick_row)
-        self.radio_follow.setChecked(True)
-        self.radio_fixed.toggled.connect(lambda on: self.pick_btn.setEnabled(on))
-        self.pick_btn.setEnabled(False)
-        lay.addWidget(pos_group, row, 0, 1, 2)
+        mode_label = QLabel("点击位置: 跟随当前鼠标")
+        mode_label.setStyleSheet("color:#607d8b;")
+        lay.addWidget(mode_label, row, 0, 1, 2)
         row += 1
 
         self.toggle_btn = QPushButton("启动 (F8)")
@@ -402,25 +416,6 @@ class ClickPanel(QWidget):
         if dlg.exec() == QDialog.Accepted and dlg.captured:
             self.key_dict = dlg.captured
             self.key_label.setText("按键: %s" % core.key_display_name(self.key_dict))
-
-    def _pick_pos(self):
-        if self._pick_overlay:
-            return
-        floating = self.window()
-        floating.hide()
-
-        def on_closed():
-            self._pick_overlay = None
-            floating.show()
-
-        ov = CoordinateOverlay(allow_keys=False, one_shot=True, on_closed=on_closed)
-        self._pick_overlay = ov
-
-        def got(x, y, kind, payload):
-            self.pos_label.setText("X:%d  Y:%d" % (x, y))
-            self.radio_fixed.setChecked(True)
-
-        ov.picked.connect(got)
 
     def apply_settings(self):
         cap = int(self.ctx.settings.get("rate_cap", 10))
@@ -452,35 +447,35 @@ class ClickPanel(QWidget):
         self.running = True
         self.toggle_btn.setChecked(True)
         self.toggle_btn.setText("停止 (%s)" % hk(self.ctx, "click", "F8"))
-        interval = 1000.0 / self.rate.value()
+
+        # 参数快照: 后台线程不跨线程读 Qt 控件
+        idx = self.type_combo.currentIndex()
+        mouse_button = MOUSE_LABELS[idx][0] if idx < len(MOUSE_LABELS) else None
+        key_dict = self.key_dict
         if self.random_mode:
-            interval = random_interval_ms(self.rate_lo.value(), self.rate_hi.value())
-        self.timer.start(int(max(1, interval)))
-        self.ctx.notify("连点任务已启动")
+            lo, hi = self.rate_lo.value(), self.rate_hi.value()
+            interval_fn = lambda: random_interval_ms(lo, hi) / 1000.0
+        else:
+            rate = self.rate.value()
+            interval_fn = lambda: 1.0 / max(1, rate)
+
+        def fire():
+            if mouse_button:
+                perform_input("mouse", mouse_button=mouse_button)
+            else:
+                perform_input("key", key_dict=key_dict)
+
+        self.clicker = ClickerThread(fire, interval_fn)
+        self.clicker.start()
+        self.ctx.notify("连点任务已启动(跟随鼠标)")
 
     def stop(self):
         self.running = False
-        self.timer.stop()
+        if self.clicker:
+            self.clicker.stop()
+            self.clicker = None
         self.toggle_btn.setChecked(False)
         self.toggle_btn.setText("启动 (%s)" % hk(self.ctx, "click", "F8"))
-
-    def _tick(self):
-        idx = self.type_combo.currentIndex()
-        if idx < len(MOUSE_LABELS):
-            fixed = None
-            if self.radio_fixed.isChecked():
-                text = self.pos_label.text()
-                try:
-                    xs, ys = text.replace("X:", "").replace("Y:", "").split()
-                    fixed = (float(xs), float(ys))
-                except Exception:
-                    fixed = None
-            perform_input("mouse", mouse_button=MOUSE_LABELS[idx][0], fixed_pos=fixed)
-        else:
-            perform_input("key", key_dict=self.key_dict)
-        if self.random_mode:
-            interval = random_interval_ms(self.rate_lo.value(), self.rate_hi.value())
-            self.timer.setInterval(int(max(1, interval)))
 
 
 # ============================================================
@@ -740,6 +735,7 @@ class SequencePanel(QWidget):
         self.player = None
         self.editor = None
         self._loading_props = False
+        self._locate_overlay = None
 
         lay = QGridLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
@@ -801,6 +797,10 @@ class SequencePanel(QWidget):
             self.prop_btn_combo.addItem(label)
         pl.addWidget(QLabel("鼠标按钮:"), 5, 0)
         pl.addWidget(self.prop_btn_combo, 5, 1)
+        self.locate_btn = QPushButton("用鼠标点选 X/Y")
+        self.locate_btn.setToolTip("点击后进入屏幕定位模式: 移动鼠标, 左键点选位置即写入 X/Y, 右键取消")
+        self.locate_btn.clicked.connect(self._locate_xy)
+        pl.addWidget(self.locate_btn, 6, 0, 1, 2)
         self.props_group.setVisible(False)
         lay.addWidget(self.props_group, 3, 0, 1, 2)
 
@@ -888,6 +888,33 @@ class SequencePanel(QWidget):
         index = self.editor._selected
         if 0 <= index < len(self.editor.items):
             self.editor.set_prop(index, field, value)
+
+    # ---------- 鼠标点选 X/Y ----------
+    def _locate_xy(self):
+        """屏幕定位: 悬浮窗先隐藏, 圆圈覆盖层跟随鼠标, 左键点选位置写入 X/Y"""
+        if self._locate_overlay or not self.editor:
+            return
+        floating = self.window()
+        floating.hide()
+
+        def on_closed():
+            self._locate_overlay = None
+            floating.show()
+
+        ov = CoordinateOverlay(allow_keys=False, one_shot=True, on_closed=on_closed)
+        self._locate_overlay = ov
+
+        def got(x, y, kind, payload):
+            self._loading_props = True
+            self.prop_x.setValue(int(x))
+            self.prop_y.setValue(int(y))
+            self._loading_props = False
+            # 屏蔽回写期间手动写入两项属性
+            self._write_prop("x", int(x))
+            self._write_prop("y", int(y))
+            self.ctx.notify("已定位: X=%d Y=%d" % (x, y))
+
+        ov.picked.connect(got)
 
     # ---------- 序列数据 ----------
     def reload(self):
@@ -1164,6 +1191,12 @@ class FloatingWindow(QWidget):
 
     def show_panel(self, idx):
         self.stack.setCurrentIndex(idx)
+        # 每次显示面板都按当前设置刷新热键文字, 杜绝改键后提示过期
+        p = self.stack.widget(idx)
+        if hasattr(p, "apply_settings"):
+            p.apply_settings()
+        if hasattr(p, "refresh_labels"):
+            p.refresh_labels()
         self.show()
         self.adjustSize()
 
@@ -1443,6 +1476,20 @@ def main():
             ctx.floating.panel_seq.editor.select(0)
             ctx.floating.panel_seq._write_prop("x", 100)
             assert ctx.floating.panel_seq.editor.items[0]["x"] == 100
+        # 热键改键后提示文字必须同步刷新
+        ctx.settings["hotkeys"]["record"] = "f8"
+        ctx.settings["hotkeys"]["click"] = "f3"
+        ctx.on_settings_changed()
+        assert "F8" in ctx.floating.panel_rec.rec_btn.text(), ctx.floating.panel_rec.rec_btn.text()
+        assert "F3" in ctx.floating.panel_fixed.toggle_btn.text(), ctx.floating.panel_fixed.toggle_btn.text()
+        ctx.floating.show_panel(3)
+        assert "F8" in ctx.floating.panel_rec.rec_btn.text()
+        # 连点线程可启停
+        t = ClickerThread(lambda: None, lambda: 0.02)
+        t.start()
+        t.stop()
+        t.join(1)
+        assert t.stopped
         print("SELFTEST OK")
         return 0
     ctx = AppContext()
