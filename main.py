@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-main.py - 按键输入自动化工具 (KeyAuto)  v1.3
+main.py - 按键输入自动化工具 (KeyAuto)  v1.4
 交互形态: 主界面选择功能 -> 主界面隐藏 -> 悬浮窗设置并运行
 悬浮窗右键 -> 返回主界面 / 急停 / 保存配置 / 退出
 
-v1.3 变更:
-  1. 连点面板删除"拾取坐标", 只保留跟随鼠标模式
-  2. 按键捕获框恢复"确定/取消"按钮; 修复跨线程定时器失效导致的卡死
-  3. 悬浮窗"动作属性"栏新增"用鼠标点选 X/Y"定位
-  4. 改热键后提示文字实时刷新(保存设置时 + 每次显示面板时双重刷新)
-  5. 连点引擎从 GUI 线程 QTimer 迁移到独立后台线程(ClickerThread),
-     点击其他程序/界面失焦/弹窗时连点不中断
+v1.4 变更:
+  1. 键盘动作属性区不再显示 X/Y/鼠标按钮/点选定位(仅鼠标动作显示)
+  2. 添加鼠标动作可选 左/右/中键(空白圆菜单 + 工具栏菜单), 已有鼠标圆
+     右键可切换按钮
+  3. 修复屏幕点选 X/Y 的 DPI 坐标偏差: 覆盖层改发物理像素坐标, 与回放坐标系一致
+  4. 修复"关闭编辑器后悬浮窗消失": 关闭 quitOnLastWindowClosed, 关编辑器/对话框
+     不再连带退出整个程序
+  5. 修复"复现中途停止": 任务执行期间悬浮窗对鼠标透明(点击穿透), 模拟点击
+     不再误触悬浮窗自身按钮(如"停止回放")或被置顶悬浮窗挡住;
+     回放线程增加异常兜底与 data/replay.log 事件日志
 
+v1.3: 连点仅跟随鼠标; 捕获框确定按钮; 鼠标点选XY; 热键提示刷新; 连点后台线程
 v1.2: 编辑器非模态化; 序列圆圈模式; 录制热键过滤
 v1.1: 全局浅色主题; 悬浮窗标题栏拖动; 高度自适应; 热键文字同步
 """
@@ -46,6 +50,8 @@ RECORD_DIR.mkdir(exist_ok=True)
 SEQ_DIR = DATA_DIR / "sequences"
 SEQ_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = DATA_DIR / "settings.json"
+# 回放诊断日志: 复现"提前停止"时打开 data/replay.log 查看执行到哪个事件
+core.Replayer.log_path = str(DATA_DIR / "replay.log")
 
 try:
     import winsound
@@ -265,7 +271,7 @@ class CoordinateOverlay(QWidget):
         self._kb_listener = None
         self._closed = False
 
-        tip_text = "移动鼠标定位圆圈 · 左键点击确认坐标 · 右键或 Esc 结束"
+        tip_text = "移动鼠标定位圆圈 · 左键点击确认坐标 · 右键或 Esc 结束 (坐标为屏幕物理像素)"
         self.tip = QLabel(tip_text, self)
         self.tip.setStyleSheet(
             "background: rgba(38,50,56,230); color: #ffffff; padding: 8px 16px;"
@@ -279,8 +285,16 @@ class CoordinateOverlay(QWidget):
         self._update_coord_label()
         self.showFullScreen()
 
+    def _to_physical(self, logical_pt):
+        """Qt 逻辑坐标 -> 屏幕物理像素(与 pynput 录制/回放坐标系一致)。
+        系统显示缩放非 100% 时两套坐标系不一致——这正是此前"点选的 XY 与
+        实际点击位置大幅偏移"的原因(偏差量 = 缩放比例)。"""
+        dpr = self.devicePixelRatioF() or 1.0
+        return round(logical_pt.x() * dpr), round(logical_pt.y() * dpr)
+
     def _update_coord_label(self):
-        self.coord.setText("X: %d   Y: %d" % (int(self._cur.x()), int(self._cur.y())))
+        px, py = self._to_physical(self._cur)
+        self.coord.setText("X: %d   Y: %d" % (px, py))
         self.coord.adjustSize()
         lx = min(self._cur.x() + 24, self.width() - self.coord.width() - 8)
         ly = min(self._cur.y() + 24, self.height() - self.coord.height() - 8)
@@ -306,8 +320,8 @@ class CoordinateOverlay(QWidget):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
-            self.picked.emit(int(e.globalPosition().x()), int(e.globalPosition().y()),
-                             "mouse", self._mouse_button)
+            px, py = self._to_physical(e.globalPosition())
+            self.picked.emit(px, py, "mouse", self._mouse_button)
             if self._one_shot:
                 self._close()
         elif e.button() == Qt.RightButton:
@@ -467,6 +481,8 @@ class ClickPanel(QWidget):
 
         self.clicker = ClickerThread(fire, interval_fn)
         self.clicker.start()
+        # 连点期间悬浮窗鼠标穿透, 防止点击打在悬浮窗上
+        self.ctx.floating.set_input_pass_through(True)
         self.ctx.notify("连点任务已启动(跟随鼠标)")
 
     def stop(self):
@@ -474,6 +490,7 @@ class ClickPanel(QWidget):
         if self.clicker:
             self.clicker.stop()
             self.clicker = None
+        self.ctx.floating.set_input_pass_through(False)
         self.toggle_btn.setChecked(False)
         self.toggle_btn.setText("启动 (%s)" % hk(self.ctx, "click", "F8"))
 
@@ -516,17 +533,28 @@ class StepCircle(QPushButton):
                 "QPushButton:hover{background:#009688;}" % border)
 
     def _menu(self, pos):
-        if self.mode == "blank" or not self.editor:
+        if not self.editor:
+            return
+        if self.mode == "blank":
+            self.editor._add_menu()
             return
         m = QMenu(self)
         if self.mode == "key":
             act_rebind = m.addAction("重新录入按键")
+        else:  # 鼠标圆: 可切换 左/右/中键
+            sub = m.addMenu("切换鼠标按钮")
+            for code, label in MOUSE_LABELS:
+                sub.addAction(label).setData(code)
         act_del = m.addAction("删除此动作")
         act_up = m.addAction("左移(提前执行)")
         act_down = m.addAction("右移(延后执行)")
         chosen = m.exec(pos)
+        if chosen is None:
+            return
         if self.mode == "key" and chosen == act_rebind:
             self.editor.rebind_key(self.index)
+        elif self.mode == "mouse" and chosen.data() is not None:
+            self.editor.set_button(self.index, chosen.data())
         elif chosen == act_del:
             self.editor.delete_item(self.index)
         elif chosen == act_up:
@@ -591,8 +619,7 @@ class SequenceEditorDialog(QDialog):
 
         btns = QHBoxLayout()
         add_mouse = QPushButton("+ 鼠标动作")
-        add_mouse.clicked.connect(lambda: self.append_item({"type": "mouse", "button": "left",
-                                                            "x": 0, "y": 0, "duration": 0.05, "delay": 0.1}))
+        add_mouse.clicked.connect(self._mouse_button_menu)
         add_key = QPushButton("+ 键盘动作(弹捕获)")
         add_key.clicked.connect(self._new_key_circle)
         del_btn = QPushButton("删除选中")
@@ -637,8 +664,8 @@ class SequenceEditorDialog(QDialog):
             c.clicked.connect(lambda _=False, i=i: self.select(i))
             self.flow_lay.addWidget(c)
         blank = StepCircle("+", "blank", -1, self)
-        blank.setToolTip("点击录入一个新按键")
-        blank.clicked.connect(lambda: self._new_key_circle())
+        blank.setToolTip("点击添加动作: 键盘按键 或 鼠标 左/右/中键")
+        blank.clicked.connect(lambda: self._add_menu())
         self.flow_lay.addWidget(blank)
         self.flow_lay.addStretch(1)
         self.count_label.setText("共 %d 个动作" % len(self.items))
@@ -670,8 +697,48 @@ class SequenceEditorDialog(QDialog):
     def _new_key_circle(self):
         dlg = CaptureKeyDialog(self)
         if dlg.exec() == QDialog.Accepted and dlg.captured:
+            # 键盘动作不需要 X/Y 坐标属性
             self.append_item({"type": "key", "key": dlg.captured,
-                              "x": 0, "y": 0, "duration": 0.05, "delay": 0})
+                              "duration": 0.05, "delay": 0})
+
+    # ---------- 添加动作: 键盘 或 鼠标(左/右/中键) ----------
+    def _add_menu(self):
+        m = QMenu(self)
+        act_key = m.addAction("键盘按键 (弹窗捕获)")
+        m.addSeparator()
+        for code, label in MOUSE_LABELS:
+            m.addAction("添加鼠标 %s 动作" % label).setData(code)
+        chosen = m.exec(QCursor.pos())
+        if chosen is None:
+            return
+        if chosen == act_key:
+            self._new_key_circle()
+        else:
+            self._add_mouse(chosen.data())
+
+    def _mouse_button_menu(self):
+        m = QMenu(self)
+        for code, label in MOUSE_LABELS:
+            m.addAction(label).setData(code)
+        chosen = m.exec(QCursor.pos())
+        if chosen is not None:
+            self._add_mouse(chosen.data())
+
+    def _add_mouse(self, button):
+        # 新鼠标动作初始坐标 = 当前鼠标所在位置(换算为物理像素), 之后可用"点选 X/Y"精调
+        scr = QApplication.primaryScreen()
+        dpr = scr.devicePixelRatio() if scr else 1.0
+        cur = QCursor.pos()
+        self.append_item({"type": "mouse", "button": button,
+                          "x": int(cur.x() * dpr), "y": int(cur.y() * dpr),
+                          "duration": 0.05, "delay": 0.1})
+
+    def set_button(self, index, button):
+        if 0 <= index < len(self.items) and self.items[index]["type"] == "mouse":
+            self.items[index]["button"] = button
+            self.refresh_circles()
+            if self._selected == index and self.on_select:
+                self.on_select(self._selected)
 
     def rebind_key(self, index):
         if 0 <= index < len(self.items) and self.items[index]["type"] == "key":
@@ -729,6 +796,8 @@ class SequenceEditorDialog(QDialog):
 # 自定义输入序列面板 (悬浮窗, 含"动作属性"编辑区)
 # ============================================================
 class SequencePanel(QWidget):
+    playback_done = Signal(bool)  # 线程安全: 执行线程结束经 Qt 信号回到 GUI 线程
+
     def __init__(self, app_ctx):
         super().__init__()
         self.ctx = app_ctx
@@ -736,6 +805,7 @@ class SequencePanel(QWidget):
         self.editor = None
         self._loading_props = False
         self._locate_overlay = None
+        self.playback_done.connect(self._on_play_done)
 
         lay = QGridLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
@@ -774,9 +844,11 @@ class SequencePanel(QWidget):
         self.prop_x.setRange(-10000, 10000)
         self.prop_y = QSpinBox()
         self.prop_y.setRange(-10000, 10000)
-        pl.addWidget(QLabel("X:"), 1, 0)
+        self.prop_x_label = QLabel("X:")
+        self.prop_y_label = QLabel("Y:")
+        pl.addWidget(self.prop_x_label, 1, 0)
         pl.addWidget(self.prop_x, 1, 1)
-        pl.addWidget(QLabel("Y:"), 2, 0)
+        pl.addWidget(self.prop_y_label, 2, 0)
         pl.addWidget(self.prop_y, 2, 1)
         self.prop_duration = QDoubleSpinBox()
         self.prop_duration.setRange(0.01, 10.0)
@@ -795,7 +867,8 @@ class SequencePanel(QWidget):
         self.prop_btn_combo = QComboBox()
         for _, label in MOUSE_LABELS:
             self.prop_btn_combo.addItem(label)
-        pl.addWidget(QLabel("鼠标按钮:"), 5, 0)
+        self.prop_btn_label = QLabel("鼠标按钮:")
+        pl.addWidget(self.prop_btn_label, 5, 0)
         pl.addWidget(self.prop_btn_combo, 5, 1)
         self.locate_btn = QPushButton("用鼠标点选 X/Y")
         self.locate_btn.setToolTip("点击后进入屏幕定位模式: 移动鼠标, 左键点选位置即写入 X/Y, 右键取消")
@@ -866,19 +939,24 @@ class SequencePanel(QWidget):
         it = self.editor.items[index]
         self._loading_props = True
         n = index + 1
-        if it["type"] == "key":
-            self.prop_index.setText("第 %d 个 · 键盘 %s" % (n, core.key_display_name(it.get("key"))))
-            self.prop_btn_combo.setEnabled(False)
-        else:
+        is_mouse = (it["type"] == "mouse")
+        if is_mouse:
             self.prop_index.setText("第 %d 个 · 鼠标动作" % n)
             self.prop_btn_combo.setEnabled(True)
             self.prop_btn_combo.setCurrentIndex(
                 [b for b, _ in MOUSE_LABELS].index(it.get("button", "left")))
-        self.prop_x.setValue(int(it.get("x", 0)))
-        self.prop_y.setValue(int(it.get("y", 0)))
+            self.prop_x.setValue(int(it.get("x", 0)))
+            self.prop_y.setValue(int(it.get("y", 0)))
+        else:
+            self.prop_index.setText("第 %d 个 · 键盘 %s" % (n, core.key_display_name(it.get("key"))))
+            self.prop_btn_combo.setEnabled(False)
         self.prop_duration.setValue(float(it.get("duration", 0.05)))
         self.prop_delay.setValue(float(it.get("delay", 0)))
         self._loading_props = False
+        # 键盘动作只显示 时长/延时; X/Y/鼠标按钮/点选定位 仅鼠标动作显示
+        for w in (self.prop_x, self.prop_x_label, self.prop_y, self.prop_y_label,
+                  self.locate_btn, self.prop_btn_combo, self.prop_btn_label):
+            w.setVisible(is_mouse)
         self.props_group.setVisible(True)
         self.ctx.floating.adjustSize()
 
@@ -946,16 +1024,19 @@ class SequencePanel(QWidget):
             self.toggle_btn.setChecked(True)
             self.toggle_btn.setText("停止")
             self.status.setText("执行中…")
+            # 执行期间悬浮窗鼠标穿透: 模拟点击不会误触自身按钮, 也不会挡住目标位置
+            self.ctx.floating.set_input_pass_through(True)
             self.ctx.notify("序列执行已启动")
 
-            def done(interrupted):
-                self.player = None
-                self.toggle_btn.setChecked(False)
-                self.toggle_btn.setText("执行")
-                self.status.setText("已中断" if interrupted else "完成")
-
-            self.player = SequencePlayer(items, loops=loops, on_done=done)
+            self.player = SequencePlayer(items, loops=loops, on_done=self.playback_done.emit)
             self.player.start()
+
+    def _on_play_done(self, interrupted):
+        self.player = None
+        self.toggle_btn.setChecked(False)
+        self.toggle_btn.setText("执行")
+        self.status.setText("已中断" if interrupted else "完成")
+        self.ctx.floating.set_input_pass_through(False)
 
     def stop(self):
         if self.player:
@@ -967,6 +1048,8 @@ class SequencePanel(QWidget):
 # 录制回放面板
 # ============================================================
 class RecordPanel(QWidget):
+    playback_done = Signal(bool)  # 线程安全: 回放线程结束经 Qt 信号回到 GUI 线程
+
     def __init__(self, app_ctx):
         super().__init__()
         self.ctx = app_ctx
@@ -974,6 +1057,7 @@ class RecordPanel(QWidget):
         self.replayer = None
         self.progress_timer = QTimer(self)
         self.progress_timer.timeout.connect(self._update_progress)
+        self.playback_done.connect(self._on_play_done)
 
         lay = QGridLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
@@ -1089,17 +1173,22 @@ class RecordPanel(QWidget):
         speed = self.speed_combo.currentData()
         self.play_btn.setText("停止回放")
         self.status.setText("▶ 回放中…")
-        self.ctx.notify("回放已开始 (倍速 %.1fx)" % speed)
+        # 回放期间悬浮窗鼠标穿透, 模拟点击不会点中悬浮窗自身按钮(如"停止回放")
+        self.ctx.floating.set_input_pass_through(True)
+        self.ctx.notify("回放已开始 (倍速 %.1fx, 急停 %s 可停)" % (speed, hk(self.ctx, "panic", "F9")))
         self.progress_timer.start(100)
 
-        def done(interrupted):
-            self.progress_timer.stop()
-            self.replayer = None
-            self.play_btn.setText("回放")
-            self.status.setText("已中断" if interrupted else "回放完成")
-
-        self.replayer = Replayer(events, speed=speed, on_done=done)
+        self.replayer = Replayer(events, speed=speed, on_done=self.playback_done.emit)
         self.replayer.start()
+
+    def _on_play_done(self, interrupted):
+        self.progress_timer.stop()
+        self.replayer = None
+        self.play_btn.setText("回放")
+        self.status.setText("已中断" if interrupted else "回放完成")
+        self.ctx.floating.set_input_pass_through(False)
+        if interrupted:
+            self.ctx.notify("回放已中断 (详情见 data/replay.log)")
 
     def _stop_play(self):
         if self.replayer:
@@ -1181,7 +1270,22 @@ class FloatingWindow(QWidget):
             self.stack.addWidget(p)
 
         self._rec_timer = None
+        self._pass_through = False
         self.apply_style()
+
+    def set_input_pass_through(self, on):
+        """任务执行期间让悬浮窗对鼠标"透明"(点击穿透):
+        1) 置顶的悬浮窗不会挡住回放/序列要点击的目标位置;
+        2) 模拟点击落在悬浮窗区域时直接穿透到下层, 不会误触悬浮窗自己的按钮
+           (此前回放的点击若恰好点中"停止回放"按钮, 复现就会莫名中断)。"""
+        on = bool(on)
+        if self._pass_through == on:
+            return
+        self._pass_through = on
+        visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowTransparentForInput, on)
+        if visible:
+            self.show()
 
     def apply_style(self, recording=False):
         opacity = self.ctx.settings.get("opacity", 0.92)
@@ -1461,21 +1565,48 @@ class AppContext:
 
 def main():
     app = QApplication(sys.argv)
+    # 关键修复: 悬浮窗是 Tool 窗口, 不参与"最后一个窗口关闭即退出"的判定;
+    # 主界面又是隐藏状态, 于是关闭编辑器/捕获对话框 = 最后一个常规窗口关闭
+    # = 整个程序被连带退出(悬浮窗瞬间消失, 后台回放线程作为 daemon 一并被杀,
+    # 表现为"复现莫名停止")。改为只能从右键菜单"退出程序"。
+    app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(GLOBAL_QSS)
     if "--selftest" in sys.argv:
+        assert not app.quitOnLastWindowClosed(), "必须关闭 lastWindowClosed 退出机制"
         ctx = AppContext()
         ctx.main.show()
         # 实例化各面板并打开一次编辑器, 验证非模态生命周期
         ctx.floating.show_panel(0)
         ctx.floating.show_panel(2)
-        ctx.floating.panel_seq._edit()
-        if ctx.floating.panel_seq.editor:
-            ctx.floating.panel_seq.editor.append_item(
-                {"type": "key", "key": {"k": "char", "v": "a"}, "x": 0, "y": 0,
-                 "duration": 0.05, "delay": 0})
-            ctx.floating.panel_seq.editor.select(0)
-            ctx.floating.panel_seq._write_prop("x", 100)
-            assert ctx.floating.panel_seq.editor.items[0]["x"] == 100
+        pseq = ctx.floating.panel_seq
+        pseq._edit()
+        ed = pseq.editor
+        assert ed is not None
+        # 鼠标动作: 属性区显示 X/Y/鼠标按钮, 可切换 左/右/中键
+        ed.append_item({"type": "mouse", "button": "right", "x": 10, "y": 20,
+                        "duration": 0.05, "delay": 0})
+        ed.select(0)
+        assert pseq.prop_x.isVisible()
+        assert pseq.prop_btn_combo.isEnabled()
+        ed.set_button(0, "middle")
+        assert ed.items[0]["button"] == "middle"
+        # 键盘动作: 不显示 X/Y/点选定位/鼠标按钮, 条目不含坐标
+        ed.append_item({"type": "key", "key": {"k": "char", "v": "a"},
+                        "duration": 0.05, "delay": 0})
+        ed.select(1)
+        assert not pseq.prop_x.isVisible()
+        assert not pseq.locate_btn.isVisible()
+        assert "x" not in ed.items[1]
+        pseq._write_prop("duration", 0.2)
+        assert ed.items[1]["duration"] == 0.2
+        # 关闭编辑器: 程序不得退出, 悬浮窗保持可见
+        ed.close()
+        app.processEvents()
+        assert pseq.editor is None
+        assert ctx.floating.isVisible()
+        # 悬浮窗鼠标穿透开关可正常切换
+        ctx.floating.set_input_pass_through(True)
+        ctx.floating.set_input_pass_through(False)
         # 热键改键后提示文字必须同步刷新
         ctx.settings["hotkeys"]["record"] = "f8"
         ctx.settings["hotkeys"]["click"] = "f3"
@@ -1484,6 +1615,12 @@ def main():
         assert "F3" in ctx.floating.panel_fixed.toggle_btn.text(), ctx.floating.panel_fixed.toggle_btn.text()
         ctx.floating.show_panel(3)
         assert "F8" in ctx.floating.panel_rec.rec_btn.text()
+        # 回放器: 日志落盘 + 线程级异常兜底(用空事件类型, 不产生真实键鼠注入)
+        rp = Replayer([{"t": 5, "type": "_test_noop"}], speed=10, on_done=lambda i: None)
+        rp.start()
+        rp.join(2)
+        assert Path(core.Replayer.log_path).exists()
+        assert "正常结束" in Path(core.Replayer.log_path).read_text(encoding="utf-8")
         # 连点线程可启停
         t = ClickerThread(lambda: None, lambda: 0.02)
         t.start()

@@ -177,7 +177,34 @@ class Recorder:
 
 # ---------- 回放器 ----------
 class Replayer(threading.Thread):
-    """在后台线程按原始时间轴复现录制事件, 支持倍速与急停"""
+    """
+    在后台线程按原始时间轴复现录制事件, 支持倍速与急停。
+
+    v1.4: 增加事件级日志(log_path)与线程级异常兜底——
+    复现"提前停止"时打开 data/replay.log 即可看到执行到了第几个事件、
+    是否被停止指令打断、线程是否抛了异常, 不再静默死亡。
+    """
+
+    log_path = None  # 由 main.py 注入: data/replay.log
+    _log_lock = threading.Lock()
+
+    def _log_reset(self):
+        if Replayer.log_path:
+            try:
+                Path(Replayer.log_path).write_text(
+                    "KeyAuto 回放日志 %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"),
+                    encoding="utf-8")
+            except Exception:
+                pass
+
+    def _log(self, text):
+        if Replayer.log_path:
+            try:
+                with Replayer._log_lock:
+                    with open(Replayer.log_path, "a", encoding="utf-8") as f:
+                        f.write(text + "\n")
+            except Exception:
+                pass
 
     def __init__(self, events, speed=1.0, on_done=None):
         super().__init__(daemon=True)
@@ -190,21 +217,34 @@ class Replayer(threading.Thread):
 
     def run(self):
         t0 = time.perf_counter()
+        self._log_reset()
+        self._log("开始回放: %d 个事件, 总时长 %.0f ms, 倍速 %.1fx"
+                  % (len(self.events), self.total_ms, self.speed))
+        interrupted = True
         try:
-            for ev in self.events:
+            for i, ev in enumerate(self.events):
                 target = ev["t"] / 1000.0 / self.speed
                 while True:
                     if self._stop.is_set():
+                        self._log("在第 %d/%d 个事件前收到停止指令" % (i + 1, len(self.events)))
                         return
                     remain = target - (time.perf_counter() - t0)
                     if remain <= 0:
                         break
                     time.sleep(min(remain, 0.02))
+                if ev["type"] != "mouse_move":
+                    self._log("执行 %d/%d  t=%6.0fms  %s"
+                              % (i + 1, len(self.events), ev["t"], ev["type"]))
                 self.elapsed_ms = ev["t"]
                 self._dispatch(ev)
+            interrupted = False
+            self._log("事件列表全部执行完毕, 回放正常结束")
+        except Exception:
+            import traceback
+            self._log("回放线程异常(已记录, 线程不再静默死亡):\n" + traceback.format_exc())
         finally:
             if self.on_done:
-                self.on_done(self._stop.is_set())
+                self.on_done(interrupted or self._stop.is_set())
 
     def _dispatch(self, ev):
         et = ev["type"]
