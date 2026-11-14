@@ -67,15 +67,24 @@ class Recorder:
        "key": {...} 或 "button": "left", "x": int, "y": int}
     """
 
-    def __init__(self, move_sample_ms=15):
+    def __init__(self, move_sample_ms=15, ignore_names=None):
+        """
+        ignore_names: 热键名集合(如 {"f6","f7"}), 这些键的事件不进入录制,
+        避免录制的开始/结束热键本身被录进事件流。
+        """
         self.events = []
         self._t0 = 0.0
         self._recording = False
         self._last_move_t = 0.0
         self._move_sample_ms = move_sample_ms
+        self._ignore = set(ignore_names or ())
         self._kb_listener = None
         self._mouse_listener = None
         self._lock = threading.Lock()
+
+    def _ignored(self, key):
+        name = getattr(key, "name", None)
+        return name is not None and name in self._ignore
 
     @property
     def recording(self):
@@ -91,12 +100,16 @@ class Recorder:
             return round((time.perf_counter() - self._t0) * 1000, 1)
 
         def on_press(key):
+            if self._ignored(key):
+                return
             s = serialize_key(key)
             if s and self._recording:
                 with self._lock:
                     self.events.append({"t": rel_t(), "type": "key_down", "key": s})
 
         def on_release(key):
+            if self._ignored(key):
+                return
             s = serialize_key(key)
             if s and self._recording:
                 with self._lock:

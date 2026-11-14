@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-main.py - 按键输入自动化工具 (KeyAuto)  v1.1
+main.py - 按键输入自动化工具 (KeyAuto)  v1.2
 交互形态: 主界面选择功能 -> 主界面隐藏 -> 悬浮窗设置并运行
 悬浮窗右键 -> 返回主界面 / 急停 / 保存配置 / 退出
 
-v1.1 修复:
-  1. 全局浅色主题 QSS, 修复深色系统下白底白字不可读
-  2. 悬浮窗标题栏成为专用拖动区, 面板打开时也可拖动
-  3. 悬浮窗宽度固定、高度随内容自适应, 修复面板内容重叠
-  4. 序列编辑器新增"屏幕拾取"圆圈覆盖层: 点击圆圈添加鼠标动作、按键添加键盘动作, 同时锁定坐标
-  5. 热键修改后所有界面按钮文字同步刷新
+v1.2 变更:
+  1. 序列编辑器改为非模态: 打开时悬浮窗仍可拖动/操作
+  2. 序列编辑改为"圆圈"模式: 空白圆点击录入按键, 圆内显示按键;
+     新动作的属性(坐标/时长/延时/鼠标按钮)同步出现在悬浮窗, 可即时修改;
+     添加先后顺序即执行顺序
+  3. 录制器过滤开始/结束热键, 热键不再被录进事件流
+
+v1.1 修复: 全局浅色主题; 悬浮窗标题栏拖动; 高度自适应防重叠; 屏幕圆圈拾取; 热键文字同步
 """
 import sys
 import time
@@ -21,9 +23,9 @@ from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QRectF
 from PySide6.QtGui import QPainter, QPen, QColor, QCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QPushButton, QVBoxLayout,
-    QHBoxLayout, QGridLayout, QStackedWidget, QComboBox, QSpinBox, QSlider,
-    QRadioButton, QButtonGroup, QLineEdit, QMessageBox, QMenu, QTableWidget,
-    QTableWidgetItem, QHeaderView, QFileDialog, QCheckBox, QGroupBox,
+    QHBoxLayout, QGridLayout, QStackedWidget, QComboBox, QSpinBox, QDoubleSpinBox,
+    QSlider, QRadioButton, QButtonGroup, QLineEdit, QMessageBox, QMenu, QScrollArea,
+    QFileDialog, QCheckBox, QGroupBox, QFrame,
 )
 
 import core
@@ -92,15 +94,7 @@ QGroupBox {
     color: #37474f; font-weight: bold;
 }
 QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; color: #37474f; }
-QTableWidget {
-    background: #ffffff; color: #263238; gridline-color: #dfe3e8;
-    border: 1px solid #cfd8dc; selection-background-color: #bbdefb; selection-color: #263238;
-}
-QHeaderView::section {
-    background: #eceff1; color: #37474f; border: 0;
-    border-right: 1px solid #cfd8dc; border-bottom: 1px solid #cfd8dc;
-    padding: 4px; font-weight: bold;
-}
+QScrollArea { border: 1px solid #cfd8dc; border-radius: 6px; background: #ffffff; }
 QMenu { background: #ffffff; color: #263238; border: 1px solid #b0bec5; }
 QMenu::item { padding: 5px 24px; }
 QMenu::item:selected { background: #e3f2fd; }
@@ -174,23 +168,15 @@ class CaptureKeyDialog(QDialog):
         self.setFixedWidth(320)
         self.captured = None
         lay = QVBoxLayout(self)
-        tip = QLabel("请在下方区域按下要绑定的按键…")
+        tip = QLabel("请按下要录入的按键…（Esc 取消）")
         tip.setWordWrap(True)
         self.show_label = QLabel("等待输入…")
         self.show_label.setAlignment(Qt.AlignCenter)
         self.show_label.setMinimumHeight(60)
         self.show_label.setStyleSheet(
             "border:1px solid #b0bec5; border-radius:6px; font-size:16px; font-weight:bold; color:#1565c0; background:#ffffff;")
-        btn_ok = QPushButton("确定")
-        btn_cancel = QPushButton("取消")
-        row = QHBoxLayout()
-        row.addWidget(btn_ok)
-        row.addWidget(btn_cancel)
         lay.addWidget(tip)
         lay.addWidget(self.show_label)
-        lay.addLayout(row)
-        btn_ok.clicked.connect(self.accept)
-        btn_cancel.clicked.connect(self.reject)
 
         self._listener = None
         self._start_capture()
@@ -199,10 +185,14 @@ class CaptureKeyDialog(QDialog):
         from pynput import keyboard as pkb
 
         def on_press(key):
+            if key == pkb.Key.esc:
+                QTimer.singleShot(0, self.reject)
+                return False
             s = core.serialize_key(key)
             if s:
                 self.captured = s
                 self.show_label.setText(core.key_display_name(s))
+                QTimer.singleShot(0, self.accept)
                 return False
             return True
 
@@ -219,14 +209,10 @@ class CaptureKeyDialog(QDialog):
 
 
 # ============================================================
-# 屏幕拾取覆盖层: 可移动圆圈 + 十字线
-#   - 鼠标移动: 圆圈跟随
-#   - 左键点击: 发出 picked(x, y, "mouse", 按钮名)
-#   - 键盘按键: 发出 picked(x, y, "key", 键数据)   (allow_keys=True 时)
-#   - 右键 / Esc: 关闭
+# 屏幕拾取覆盖层 (供连点面板"拾取坐标"使用)
 # ============================================================
 class CoordinateOverlay(QWidget):
-    picked = Signal(int, int, str, object)  # x, y, kind, payload(Qt 队列跨线程投递)
+    picked = Signal(int, int, str, object)
 
     def __init__(self, allow_keys=True, mouse_button="left", one_shot=False, on_closed=None):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -243,10 +229,7 @@ class CoordinateOverlay(QWidget):
         self._kb_listener = None
         self._closed = False
 
-        tip_text = "移动鼠标定位圆圈 · 左键点击确认坐标"
-        if allow_keys:
-            tip_text += " · 按任意键添加键盘动作"
-        tip_text += " · 右键或 Esc 结束"
+        tip_text = "移动鼠标定位圆圈 · 左键点击确认坐标 · 右键或 Esc 结束"
         self.tip = QLabel(tip_text, self)
         self.tip.setStyleSheet(
             "background: rgba(38,50,56,230); color: #ffffff; padding: 8px 16px;"
@@ -258,26 +241,7 @@ class CoordinateOverlay(QWidget):
             "background: rgba(21,101,192,230); color: #ffffff; padding: 6px 12px;"
             "border-radius: 6px; font-size: 14px; font-weight: bold;")
         self._update_coord_label()
-
-        if allow_keys:
-            self._start_kb_capture()
         self.showFullScreen()
-
-    def _start_kb_capture(self):
-        from pynput import keyboard as pkb
-
-        def on_press(key):
-            if key == pkb.Key.esc:
-                QTimer.singleShot(0, self._close)
-                return False
-            s = core.serialize_key(key)
-            if s:
-                pos = QCursor.pos()
-                self.picked.emit(int(pos.x()), int(pos.y()), "key", s)
-            return True
-
-        self._kb_listener = pkb.Listener(on_press=on_press)
-        self._kb_listener.start()
 
     def _update_coord_label(self):
         self.coord.setText("X: %d   Y: %d" % (int(self._cur.x()), int(self._cur.y())))
@@ -297,11 +261,6 @@ class CoordinateOverlay(QWidget):
         p.setPen(QPen(QColor(229, 57, 53), 2))
         p.setBrush(Qt.NoBrush)
         p.drawEllipse(QRectF(cx - 16, cy - 16, 32, 32))
-        p.setPen(QPen(QColor(229, 57, 53, 120), 1))
-        p.drawLine(cx - 24, cy, cx - 16, cy)
-        p.drawLine(cx + 16, cy, cx + 24, cy)
-        p.drawLine(cx, cy - 24, cx, cy - 16)
-        p.drawLine(cx, cy + 16, cx, cy + 24)
         p.end()
 
     def mouseMoveEvent(self, e):
@@ -333,11 +292,6 @@ class CoordinateOverlay(QWidget):
 
     def closeEvent(self, e):
         self._closed = True
-        if self._kb_listener:
-            try:
-                self._kb_listener.stop()
-            except Exception:
-                pass
         if self._on_closed:
             self._on_closed()
         e.accept()
@@ -450,7 +404,6 @@ class ClickPanel(QWidget):
             self.key_label.setText("按键: %s" % core.key_display_name(self.key_dict))
 
     def _pick_pos(self):
-        """屏幕拾取: 悬浮窗先隐藏, 覆盖层圆圈定位, 左键点击确认坐标"""
         if self._pick_overlay:
             return
         floating = self.window()
@@ -531,13 +484,263 @@ class ClickPanel(QWidget):
 
 
 # ============================================================
-# 自定义输入序列面板
+# 序列动作圆圈 (编辑器中的可视单元)
+# ============================================================
+class StepCircle(QPushButton):
+    """56px 圆形按钮: 空白圆=添加, 键盘圆=蓝, 鼠标圆=青, 选中=红圈"""
+
+    SIZE = 56
+
+    def __init__(self, text="", mode="blank", index=-1, editor=None):
+        super().__init__(text)
+        self.mode = mode
+        self.index = index
+        self.editor = editor
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+        self.apply_style(selected=False)
+
+    def apply_style(self, selected):
+        border = "border: 3px solid #e53935;" if selected else "border: none;"
+        if self.mode == "blank":
+            self.setStyleSheet(
+                "QPushButton{background:transparent;color:#90a4ae;"
+                "border:2px dashed #b0bec5;border-radius:28px;font-size:20px;font-weight:bold;}"
+                "QPushButton:hover{border-color:#64b5f6;color:#64b5f6;}")
+        elif self.mode == "key":
+            self.setStyleSheet(
+                "QPushButton{background:#1565c0;color:#ffffff;border-radius:28px;"
+                "font-weight:bold;font-size:12px;%s}"
+                "QPushButton:hover{background:#1976d2;}" % border)
+        else:  # mouse
+            self.setStyleSheet(
+                "QPushButton{background:#00897b;color:#ffffff;border-radius:28px;"
+                "font-weight:bold;font-size:13px;%s}"
+                "QPushButton:hover{background:#009688;}" % border)
+
+    def _menu(self, pos):
+        if self.mode == "blank" or not self.editor:
+            return
+        m = QMenu(self)
+        if self.mode == "key":
+            act_rebind = m.addAction("重新录入按键")
+        act_del = m.addAction("删除此动作")
+        act_up = m.addAction("左移(提前执行)")
+        act_down = m.addAction("右移(延后执行)")
+        chosen = m.exec(pos)
+        if self.mode == "key" and chosen == act_rebind:
+            self.editor.rebind_key(self.index)
+        elif chosen == act_del:
+            self.editor.delete_item(self.index)
+        elif chosen == act_up:
+            self.editor.move_item(self.index, -1)
+        elif chosen == act_down:
+            self.editor.move_item(self.index, 1)
+
+
+# ============================================================
+# 序列编辑器 (非模态 + 圆圈流程)
+# ============================================================
+class SequenceEditorDialog(QDialog):
+    """
+    圆圈模式序列编辑器:
+    - 末尾常驻一个空白圆, 点击弹出按键捕获, 录入后圆内显示按键并自动选中
+    - 左键点击圆 = 选中(悬浮窗显示其属性), 右键圆 = 重新录入/删除/移动
+    - items 列表顺序即执行顺序
+    - 属性(坐标/时长/延时/鼠标按钮)由悬浮窗的"动作属性"区编辑, 通过 set_prop 写回
+    """
+
+    def __init__(self, parent, on_select=None, on_items_changed=None):
+        super().__init__(parent)
+        self.setWindowTitle("编辑输入序列 (圆圈模式)")
+        self.setModal(False)  # 非模态: 打开时悬浮窗仍可拖动与操作
+        self.resize(560, 300)
+        self.current_file = None
+        self.items = []
+        self._selected = -1
+        self.on_select = on_select
+        self.on_items_changed = on_items_changed
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 12)
+        lay.setSpacing(8)
+
+        top = QHBoxLayout()
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("序列名称")
+        top.addWidget(self.name_edit, 1)
+        load_btn = QPushButton("载入…")
+        load_btn.clicked.connect(self._load)
+        top.addWidget(load_btn)
+        lay.addLayout(top)
+
+        tip = QLabel("点击末尾空白圆录入按键 · 点击圆圈选中(属性在悬浮窗修改) · 右键圆圈: 重录/删除/移动")
+        tip.setStyleSheet("color:#607d8b;")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        # 圆圈流程区
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setMinimumHeight(120)
+        self.flow_widget = QWidget()
+        self.flow_widget.setStyleSheet("background:#ffffff;")
+        self.flow_lay = QHBoxLayout(self.flow_widget)
+        self.flow_lay.setContentsMargins(10, 10, 10, 10)
+        self.flow_lay.setSpacing(10)
+        self.flow_lay.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.scroll.setWidget(self.flow_widget)
+        lay.addWidget(self.scroll, 1)
+
+        btns = QHBoxLayout()
+        add_mouse = QPushButton("+ 鼠标动作")
+        add_mouse.clicked.connect(lambda: self.append_item({"type": "mouse", "button": "left",
+                                                            "x": 0, "y": 0, "duration": 0.05, "delay": 0.1}))
+        add_key = QPushButton("+ 键盘动作(弹捕获)")
+        add_key.clicked.connect(self._new_key_circle)
+        del_btn = QPushButton("删除选中")
+        del_btn.clicked.connect(lambda: self.delete_item(self._selected))
+        for b in (add_mouse, add_key, del_btn):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+
+        bottom = QHBoxLayout()
+        self.count_label = QLabel("共 0 个动作")
+        self.count_label.setStyleSheet("color:#607d8b;")
+        save_btn = QPushButton("保存")
+        save_btn.setStyleSheet("font-weight:bold;")
+        save_btn.clicked.connect(self._save)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.reject)
+        bottom.addWidget(self.count_label)
+        bottom.addStretch(1)
+        bottom.addWidget(save_btn)
+        bottom.addWidget(close_btn)
+        lay.addLayout(bottom)
+
+    # ---------- 圆圈渲染 ----------
+    def refresh_circles(self):
+        while self.flow_lay.count():
+            item = self.flow_lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        for i, it in enumerate(self.items):
+            if it["type"] == "key":
+                text = core.key_display_name(it.get("key"))
+                text = text if len(text) <= 6 else text[:5] + "…"
+                c = StepCircle(text, "key", i, self)
+            else:
+                btn_name = it.get("button", "left")
+                short = {"left": "左键", "right": "右键", "middle": "中键"}.get(btn_name, btn_name)
+                c = StepCircle(short, "mouse", i, self)
+            c.setToolTip("第 %d 个动作: %s" % (i + 1, self._item_desc(it)))
+            c.apply_style(selected=(i == self._selected))
+            c.clicked.connect(lambda _=False, i=i: self.select(i))
+            self.flow_lay.addWidget(c)
+        blank = StepCircle("+", "blank", -1, self)
+        blank.setToolTip("点击录入一个新按键")
+        blank.clicked.connect(lambda: self._new_key_circle())
+        self.flow_lay.addWidget(blank)
+        self.flow_lay.addStretch(1)
+        self.count_label.setText("共 %d 个动作" % len(self.items))
+
+    def _item_desc(self, it):
+        if it["type"] == "key":
+            return "键盘 %s, 按住 %.2fs, 延时 %.2fs" % (
+                core.key_display_name(it.get("key")), it.get("duration", 0.05), it.get("delay", 0))
+        return "鼠标 %s @(%d,%d), 按住 %.2fs, 延时 %.2fs" % (
+            it.get("button", "left"), it.get("x", 0), it.get("y", 0),
+            it.get("duration", 0.05), it.get("delay", 0))
+
+    # ---------- 选择 / 增删移 ----------
+    def select(self, index):
+        if index < 0 or index >= len(self.items):
+            self._selected = -1
+        else:
+            self._selected = index
+        self.refresh_circles()
+        if self.on_select:
+            self.on_select(self._selected)
+
+    def append_item(self, item):
+        self.items.append(item)
+        self.select(len(self.items) - 1)
+        if self.on_items_changed:
+            self.on_items_changed()
+
+    def _new_key_circle(self):
+        dlg = CaptureKeyDialog(self)
+        if dlg.exec() == QDialog.Accepted and dlg.captured:
+            self.append_item({"type": "key", "key": dlg.captured,
+                              "x": 0, "y": 0, "duration": 0.05, "delay": 0})
+
+    def rebind_key(self, index):
+        if 0 <= index < len(self.items) and self.items[index]["type"] == "key":
+            dlg = CaptureKeyDialog(self)
+            if dlg.exec() == QDialog.Accepted and dlg.captured:
+                self.items[index]["key"] = dlg.captured
+                self.select(index)
+
+    def delete_item(self, index):
+        if 0 <= index < len(self.items):
+            del self.items[index]
+            self.select(-1)
+            if self.on_items_changed:
+                self.on_items_changed()
+
+    def move_item(self, index, delta):
+        target = index + delta
+        if 0 <= index < len(self.items) and 0 <= target < len(self.items):
+            self.items[index], self.items[target] = self.items[target], self.items[index]
+            self.select(target)
+            if self.on_items_changed:
+                self.on_items_changed()
+
+    # ---------- 悬浮窗属性写回 ----------
+    def set_prop(self, index, field, value):
+        if 0 <= index < len(self.items):
+            self.items[index][field] = value
+            self.refresh_circles()
+
+    # ---------- 载入 / 保存 ----------
+    def _load(self):
+        path, _ = QFileDialog.getOpenFileName(self, "载入序列", str(SEQ_DIR), "JSON (*.json)")
+        if not path:
+            return
+        data = core.load_json(path, {})
+        self.current_file = path
+        self.name_edit.setText(data.get("name", ""))
+        self.items = list(data.get("items", []))
+        self.select(-1)
+        if self.on_items_changed:
+            self.on_items_changed()
+
+    def _save(self):
+        name = self.name_edit.text().strip() or "未命名序列"
+        if not self.items:
+            QMessageBox.warning(self, "提示", "序列为空, 请先点击空白圆录入按键或添加动作")
+            return
+        path = self.current_file or str(SEQ_DIR / ("%s.json" % name))
+        core.save_json(path, {"name": name, "items": self.items})
+        self.current_file = path
+        QMessageBox.information(self, "已保存", "序列已保存到:\n%s\n\n回悬浮窗点\"刷新\"即可执行" % path)
+
+
+# ============================================================
+# 自定义输入序列面板 (悬浮窗, 含"动作属性"编辑区)
 # ============================================================
 class SequencePanel(QWidget):
     def __init__(self, app_ctx):
         super().__init__()
         self.ctx = app_ctx
         self.player = None
+        self.editor = None
+        self._loading_props = False
+
         lay = QGridLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setHorizontalSpacing(10)
@@ -546,15 +749,68 @@ class SequencePanel(QWidget):
         lay.addWidget(QLabel("序列:"), 0, 0)
         self.seq_combo = QComboBox()
         lay.addWidget(self.seq_combo, 0, 1)
+        btn_row = QHBoxLayout()
         edit_btn = QPushButton("编辑序列…")
         edit_btn.clicked.connect(self._edit)
-        lay.addWidget(edit_btn, 1, 1)
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self.reload)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(refresh_btn)
+        lay.addLayout(btn_row, 1, 1)
         lay.addWidget(QLabel("循环次数:"), 2, 0)
         self.loop_spin = QSpinBox()
         self.loop_spin.setRange(0, 9999)
         self.loop_spin.setValue(1)
         self.loop_spin.setToolTip("0 = 无限循环")
         lay.addWidget(self.loop_spin, 2, 1)
+
+        # ---- 动作属性区: 编辑器选中圆圈时出现 ----
+        self.props_group = QGroupBox("动作属性 (选中编辑器中的圆圈)")
+        pl = QGridLayout(self.props_group)
+        pl.setContentsMargins(10, 16, 10, 8)
+        pl.setHorizontalSpacing(8)
+        pl.setVerticalSpacing(6)
+        self.prop_index = QLabel("未选择")
+        self.prop_index.setStyleSheet("color:#1565c0;font-weight:bold;")
+        pl.addWidget(QLabel("动作:"), 0, 0)
+        pl.addWidget(self.prop_index, 0, 1)
+        self.prop_x = QSpinBox()
+        self.prop_x.setRange(-10000, 10000)
+        self.prop_y = QSpinBox()
+        self.prop_y.setRange(-10000, 10000)
+        pl.addWidget(QLabel("X:"), 1, 0)
+        pl.addWidget(self.prop_x, 1, 1)
+        pl.addWidget(QLabel("Y:"), 2, 0)
+        pl.addWidget(self.prop_y, 2, 1)
+        self.prop_duration = QDoubleSpinBox()
+        self.prop_duration.setRange(0.01, 10.0)
+        self.prop_duration.setDecimals(2)
+        self.prop_duration.setSingleStep(0.05)
+        self.prop_duration.setSuffix(" s")
+        pl.addWidget(QLabel("按住时长:"), 3, 0)
+        pl.addWidget(self.prop_duration, 3, 1)
+        self.prop_delay = QDoubleSpinBox()
+        self.prop_delay.setRange(0.0, 60.0)
+        self.prop_delay.setDecimals(2)
+        self.prop_delay.setSingleStep(0.1)
+        self.prop_delay.setSuffix(" s")
+        pl.addWidget(QLabel("执行后延时:"), 4, 0)
+        pl.addWidget(self.prop_delay, 4, 1)
+        self.prop_btn_combo = QComboBox()
+        for _, label in MOUSE_LABELS:
+            self.prop_btn_combo.addItem(label)
+        pl.addWidget(QLabel("鼠标按钮:"), 5, 0)
+        pl.addWidget(self.prop_btn_combo, 5, 1)
+        self.props_group.setVisible(False)
+        lay.addWidget(self.props_group, 3, 0, 1, 2)
+
+        # 属性写回
+        self.prop_x.valueChanged.connect(lambda v: self._write_prop("x", v))
+        self.prop_y.valueChanged.connect(lambda v: self._write_prop("y", v))
+        self.prop_duration.valueChanged.connect(lambda v: self._write_prop("duration", v))
+        self.prop_delay.valueChanged.connect(lambda v: self._write_prop("delay", v))
+        self.prop_btn_combo.currentIndexChanged.connect(
+            lambda i: self._write_prop("button", MOUSE_LABELS[i][0]))
 
         self.toggle_btn = QPushButton("执行")
         self.toggle_btn.setMinimumHeight(36)
@@ -563,17 +819,84 @@ class SequencePanel(QWidget):
             "QPushButton:checked{background:#c62828;}")
         self.toggle_btn.setCheckable(True)
         self.toggle_btn.clicked.connect(self._toggle)
-        lay.addWidget(self.toggle_btn, 3, 0, 1, 2)
+        lay.addWidget(self.toggle_btn, 4, 0, 1, 2)
 
         self.status = QLabel("空闲")
-        lay.addWidget(self.status, 4, 0, 1, 2)
+        lay.addWidget(self.status, 5, 0, 1, 2)
         self.reload()
 
+    # ---------- 编辑器生命周期 (非模态) ----------
+    def _edit(self):
+        if self.editor:
+            self.editor.show()
+            self.editor.raise_()
+            self.editor.activateWindow()
+            return
+        dlg = SequenceEditorDialog(self, on_select=self._show_props,
+                                   on_items_changed=self.reload_status)
+        dlg.finished.connect(self._editor_closed)
+        dlg.refresh_circles()
+        dlg.show()
+        self.editor = dlg
+        self.reload_status()
+
+    def _editor_closed(self):
+        self.editor = None
+        self.props_group.setVisible(False)
+        self.ctx.floating.adjustSize()
+        self.reload()
+        self.reload_status()
+
+    def close_editor(self):
+        if self.editor:
+            self.editor.close()
+
+    def reload_status(self):
+        if self.editor:
+            self.status.setText("编辑器开启: 共 %d 个动作 (点击圆圈在此处改属性)" % len(self.editor.items))
+        else:
+            self.reload()
+
+    # ---------- 属性显示 / 写回 ----------
+    def _show_props(self, index):
+        if not self.editor or index < 0 or index >= len(self.editor.items):
+            self.props_group.setVisible(False)
+            self.ctx.floating.adjustSize()
+            return
+        it = self.editor.items[index]
+        self._loading_props = True
+        n = index + 1
+        if it["type"] == "key":
+            self.prop_index.setText("第 %d 个 · 键盘 %s" % (n, core.key_display_name(it.get("key"))))
+            self.prop_btn_combo.setEnabled(False)
+        else:
+            self.prop_index.setText("第 %d 个 · 鼠标动作" % n)
+            self.prop_btn_combo.setEnabled(True)
+            self.prop_btn_combo.setCurrentIndex(
+                [b for b, _ in MOUSE_LABELS].index(it.get("button", "left")))
+        self.prop_x.setValue(int(it.get("x", 0)))
+        self.prop_y.setValue(int(it.get("y", 0)))
+        self.prop_duration.setValue(float(it.get("duration", 0.05)))
+        self.prop_delay.setValue(float(it.get("delay", 0)))
+        self._loading_props = False
+        self.props_group.setVisible(True)
+        self.ctx.floating.adjustSize()
+
+    def _write_prop(self, field, value):
+        if self._loading_props or not self.editor:
+            return
+        index = self.editor._selected
+        if 0 <= index < len(self.editor.items):
+            self.editor.set_prop(index, field, value)
+
+    # ---------- 序列数据 ----------
     def reload(self):
         self.seq_combo.clear()
         for f in sorted(SEQ_DIR.glob("*.json")):
             data = core.load_json(f, {})
             self.seq_combo.addItem(data.get("name", f.stem), str(f))
+        if not self.editor:
+            self.status.setText("空闲")
 
     def current_items(self):
         idx = self.seq_combo.currentIndex()
@@ -589,7 +912,7 @@ class SequencePanel(QWidget):
         else:
             items, _ = self.current_items()
             if not items:
-                QMessageBox.warning(self, "提示", "没有可用的序列, 请先编辑创建")
+                QMessageBox.warning(self, "提示", "没有可用的序列, 请先编辑并保存")
                 self.toggle_btn.setChecked(False)
                 return
             loops = self.loop_spin.value()
@@ -610,222 +933,7 @@ class SequencePanel(QWidget):
     def stop(self):
         if self.player:
             self.player.stop()
-
-    def _edit(self):
-        dlg = SequenceEditorDialog(self)
-        dlg.exec()
-        self.reload()
-
-
-class SequenceEditorDialog(QDialog):
-    """序列编辑器: 表格增删改 + 上下移动 + 屏幕拾取(圆圈) + 保存"""
-
-    COLUMNS = ["类型", "按键/按钮", "X", "Y", "按下时长(s)", "延时(s)"]
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("编辑输入序列")
-        self.resize(600, 430)
-        self.current_file = None
-        self._overlay = None
-
-        lay = QVBoxLayout(self)
-        lay.setSpacing(8)
-        top = QHBoxLayout()
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("序列名称")
-        load_btn = QPushButton("载入…")
-        load_btn.clicked.connect(self._load)
-        top.addWidget(self.name_edit, 1)
-        top.addWidget(load_btn)
-        lay.addLayout(top)
-
-        self.table = QTableWidget(0, len(self.COLUMNS))
-        self.table.setHorizontalHeaderLabels(self.COLUMNS)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        lay.addWidget(self.table, 1)
-
-        # 拾取工具行: 选择鼠标按钮 + 进入屏幕圆圈拾取模式
-        pick_row = QHBoxLayout()
-        pick_row.addWidget(QLabel("拾取动作按钮:"))
-        self.pick_btn_combo = QComboBox()
-        for _, label in MOUSE_LABELS:
-            self.pick_btn_combo.addItem(label)
-        pick_row.addWidget(self.pick_btn_combo)
-        self.overlay_btn = QPushButton("屏幕拾取 (圆圈模式)")
-        self.overlay_btn.setStyleSheet("font-weight:bold;")
-        self.overlay_btn.clicked.connect(self._toggle_overlay)
-        pick_row.addWidget(self.overlay_btn)
-        pick_row.addStretch(1)
-        self.overlay_hint = QLabel("")
-        self.overlay_hint.setStyleSheet("color:#1565c0;background:transparent;")
-        pick_row.addWidget(self.overlay_hint)
-        lay.addLayout(pick_row)
-
-        btns = QHBoxLayout()
-        add_mouse = QPushButton("+ 鼠标动作")
-        add_mouse.clicked.connect(lambda: self._add_row("mouse"))
-        add_key = QPushButton("+ 键盘动作")
-        add_key.clicked.connect(lambda: self._add_row("key"))
-        del_btn = QPushButton("删除选中")
-        del_btn.clicked.connect(self._del_row)
-        up_btn = QPushButton("上移")
-        up_btn.clicked.connect(lambda: self._move(-1))
-        down_btn = QPushButton("下移")
-        down_btn.clicked.connect(lambda: self._move(1))
-        for b in (add_mouse, add_key, del_btn, up_btn, down_btn):
-            btns.addWidget(b)
-        lay.addLayout(btns)
-
-        bottom = QHBoxLayout()
-        save_btn = QPushButton("保存")
-        save_btn.clicked.connect(self._save)
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(self.reject)
-        bottom.addStretch(1)
-        bottom.addWidget(save_btn)
-        bottom.addWidget(close_btn)
-        lay.addLayout(bottom)
-
-    # ---- 屏幕圆圈拾取 ----
-    def _toggle_overlay(self):
-        if self._overlay:
-            self._overlay._close()
-            return
-        self._overlay = CoordinateOverlay(
-            allow_keys=True, one_shot=False,
-            mouse_button=MOUSE_LABELS[self.pick_btn_combo.currentIndex()][0],
-            on_closed=self._overlay_done)
-        self.overlay_hint.setText("圆圈模式中: 点击=加鼠标动作, 按键=加键盘动作, 右键结束")
-        self._overlay.picked.connect(self._add_picked)
-
-    def _overlay_done(self):
-        self._overlay = None
-        self.overlay_hint.setText("拾取已结束")
-
-    def _add_picked(self, x, y, kind, payload):
-        """由覆盖层(含 pynput 线程)发来的信号, Qt 自动队列投递到 GUI 线程"""
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        if kind == "mouse":
-            values = ["mouse", payload, str(x), str(y), "0.05", "0.1"]
-            for c, v in enumerate(values):
-                self.table.setItem(r, c, QTableWidgetItem(v))
-        else:
-            item_btn = QTableWidgetItem(core.key_display_name(payload))
-            item_btn.setData(Qt.UserRole, payload)
-            values = ["key", None, str(x), str(y), "0.05", "0"]
-            for c, v in enumerate(values):
-                if c == 1:
-                    self.table.setItem(r, c, item_btn)
-                else:
-                    self.table.setItem(r, c, QTableWidgetItem(v))
-        self.table.scrollToBottom()
-        self.table.setCurrentCell(r, 0)
-
-    def _add_row(self, type_):
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        if type_ == "mouse":
-            values = ["mouse", "left", "0", "0", "0.05", "0.1"]
-        else:
-            values = ["key", "(未设置)", "-", "-", "0.05", "0"]
-        for c, v in enumerate(values):
-            self.table.setItem(r, c, QTableWidgetItem(v))
-
-    def _del_row(self):
-        r = self.table.currentRow()
-        if r >= 0:
-            self.table.removeRow(r)
-
-    def _move(self, delta):
-        r = self.table.currentRow()
-        if r < 0:
-            return
-        target = r + delta
-        if 0 <= target < self.table.rowCount():
-            values = []
-            for c in range(self.table.columnCount()):
-                it = self.table.takeItem(r, c)
-                values.append((it.text() if it else "", it.data(Qt.UserRole) if it else None))
-            self.table.removeRow(r)
-            self.table.insertRow(target)
-            for c, (text, role) in enumerate(values):
-                item = QTableWidgetItem(text)
-                if role is not None:
-                    item.setData(Qt.UserRole, role)
-                self.table.setItem(target, c, item)
-            self.table.setCurrentCell(target, 0)
-
-    def _load(self):
-        path, _ = QFileDialog.getOpenFileName(self, "载入序列", str(SEQ_DIR), "JSON (*.json)")
-        if not path:
-            return
-        data = core.load_json(path, {})
-        self.current_file = path
-        self.name_edit.setText(data.get("name", ""))
-        self.table.setRowCount(0)
-        for it in data.get("items", []):
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            if it["type"] == "mouse":
-                values = ["mouse", it.get("button", "left"), str(it.get("x", 0)), str(it.get("y", 0)),
-                          str(it.get("duration", 0.05)), str(it.get("delay", 0))]
-            else:
-                kd = it.get("key")
-                values = ["key", core.key_display_name(kd), str(it.get("x", "-")), str(it.get("y", "-")),
-                          str(it.get("duration", 0.05)), str(it.get("delay", 0))]
-            for c, v in enumerate(values):
-                item = QTableWidgetItem(v)
-                if it["type"] == "key" and c == 1 and kd:
-                    item.setData(Qt.UserRole, kd)
-                self.table.setItem(r, c, item)
-
-    def _save(self):
-        if self._overlay:
-            self._overlay._close()
-        name = self.name_edit.text().strip() or "未命名序列"
-        items = []
-        for r in range(self.table.rowCount()):
-            def cell(c):
-                it = self.table.item(r, c)
-                return it.text().strip() if it else ""
-
-            def num(c, default):
-                try:
-                    return float(cell(c))
-                except Exception:
-                    return default
-
-            type_ = cell(0)
-            if type_ not in ("mouse", "key"):
-                continue
-            if type_ == "mouse":
-                items.append({
-                    "type": "mouse", "button": cell(1) or "left",
-                    "x": int(num(2, 0)), "y": int(num(3, 0)),
-                    "duration": num(4, 0.05), "delay": num(5, 0),
-                })
-            else:
-                it = self.table.item(r, 1)
-                kd = it.data(Qt.UserRole) if it else None
-                if not kd:
-                    kd = {"k": "char", "v": "a"}
-                item = {"type": "key", "key": kd,
-                        "duration": num(4, 0.05), "delay": num(5, 0)}
-                x, y = cell(2), cell(3)
-                if x not in ("-", "") and y not in ("-", ""):
-                    try:
-                        item["x"], item["y"] = int(float(x)), int(float(y))
-                    except Exception:
-                        pass
-                items.append(item)
-        if not items:
-            QMessageBox.warning(self, "提示", "序列为空, 请先添加动作")
-            return
-        path = self.current_file or str(SEQ_DIR / ("%s.json" % name))
-        core.save_json(path, {"name": name, "items": items})
-        QMessageBox.information(self, "已保存", "序列已保存到:\n%s" % path)
+        self.close_editor()
 
 
 # ============================================================
@@ -903,10 +1011,14 @@ class RecordPanel(QWidget):
 
     def start_record(self):
         self.name_edit.setEnabled(False)
-        self.recorder = Recorder()
+        # 录制开始/结束热键不录入事件流
+        ignore = {self.ctx.settings["hotkeys"].get("record", "f6"),
+                  self.ctx.settings["hotkeys"].get("stop_record", "f7")}
+        self.recorder = Recorder(ignore_names=ignore)
         self.recorder.start()
         self.refresh_labels()
-        self.status.setText("● 录制中…")
+        self.status.setText("● 录制中… (热键 %s/%s 不录入)"
+                            % (hk(self.ctx, "record", "F6"), hk(self.ctx, "stop_record", "F7")))
         self.ctx.enter_rec_state()
         if self.ctx.settings.get("sound", True):
             beep("start")
@@ -1055,7 +1167,6 @@ class FloatingWindow(QWidget):
         self.show()
         self.adjustSize()
 
-    # ---- 右键菜单 (标题栏右键由 DragHeader 转发到这里) ----
     def show_menu(self, pos):
         m = QMenu(self)
         act_back = m.addAction("返回主界面(切换功能)")
@@ -1078,7 +1189,6 @@ class FloatingWindow(QWidget):
         if e.button() == Qt.RightButton:
             self.show_menu(e.globalPosition().toPoint())
 
-    # ---- 录制态 ----
     def enter_rec_state(self):
         self.apply_style(recording=True)
         self._rec_t0 = time.time()
@@ -1098,7 +1208,6 @@ class FloatingWindow(QWidget):
         secs = int(time.time() - self._rec_t0)
         self.header.setText("● REC 录制中 — %02d:%02d" % (secs // 60, secs % 60))
 
-    # ---- 停止一切 ----
     def stop_all_tasks(self):
         self.panel_fixed.stop()
         self.panel_random.stop()
@@ -1136,7 +1245,7 @@ class MainWindow(QMainWindow):
         cards = [
             ("定频连点", "固定频率重复点击/按键"),
             ("随机频率连点", "每秒次数在范围内随机"),
-            ("自定义输入序列", "编排键鼠动作并循环执行"),
+            ("自定义输入序列", "圆圈编排键鼠动作并循环执行"),
             ("录制与回放", "录制真实输入, 之后复现"),
         ]
         grid = QGridLayout()
@@ -1236,7 +1345,7 @@ class SettingsDialog(QDialog):
 
 
 # ============================================================
-# 应用上下文 (串联主界面/悬浮窗/热键)
+# 应用上下文
 # ============================================================
 class AppContext:
     def __init__(self):
@@ -1250,7 +1359,6 @@ class AppContext:
         self.hotkeys.start(self.settings["hotkeys"])
 
     def on_settings_changed(self):
-        """设置保存后: 刷新悬浮窗样式、所有面板参数与热键文字、主界面提示"""
         self.floating.apply_style()
         for i in range(self.floating.stack.count()):
             p = self.floating.stack.widget(i)
@@ -1291,7 +1399,6 @@ class AppContext:
         self.floating.exit_rec_state()
 
     def notify(self, text):
-        # 在悬浮窗头部短暂显示通知(录制态时不覆盖 REC 计时)
         if getattr(self.floating, "_rec_timer", None) is not None:
             return
         header = self.floating.header
@@ -1325,7 +1432,17 @@ def main():
     if "--selftest" in sys.argv:
         ctx = AppContext()
         ctx.main.show()
+        # 实例化各面板并打开一次编辑器, 验证非模态生命周期
         ctx.floating.show_panel(0)
+        ctx.floating.show_panel(2)
+        ctx.floating.panel_seq._edit()
+        if ctx.floating.panel_seq.editor:
+            ctx.floating.panel_seq.editor.append_item(
+                {"type": "key", "key": {"k": "char", "v": "a"}, "x": 0, "y": 0,
+                 "duration": 0.05, "delay": 0})
+            ctx.floating.panel_seq.editor.select(0)
+            ctx.floating.panel_seq._write_prop("x", 100)
+            assert ctx.floating.panel_seq.editor.items[0]["x"] == 100
         print("SELFTEST OK")
         return 0
     ctx = AppContext()
