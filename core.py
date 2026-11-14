@@ -206,8 +206,17 @@ class Replayer(threading.Thread):
             except Exception:
                 pass
 
-    def __init__(self, events, speed=1.0, on_done=None):
+    def __init__(self, events, speed=1.0, on_done=None, max_gap_ms=None):
+        """
+        max_gap_ms: 压缩长等待——录制中超过该值的空闲间隔被压缩为该值,
+        避免录制时的发呆时间在回放时表现为"卡住/暂停"。None 表示不压缩。
+        """
         super().__init__(daemon=True)
+        self._compressed_ms = 0
+        if max_gap_ms:
+            orig_total = max((e["t"] for e in events), default=0)
+            events = self.compress_timeline(events, max_gap_ms)
+            self._compressed_ms = orig_total - (events[-1]["t"] if events else 0)
         self.events = sorted(events, key=lambda e: e["t"])
         self.speed = max(0.1, speed)
         self.on_done = on_done
@@ -215,11 +224,24 @@ class Replayer(threading.Thread):
         self.total_ms = self.events[-1]["t"] if self.events else 0
         self.elapsed_ms = 0
 
+    @staticmethod
+    def compress_timeline(events, max_gap_ms):
+        """把超过 max_gap_ms 的事件间隔压缩为 max_gap_ms, 返回新列表(不改原数据)。"""
+        out, shift, prev = [], 0.0, 0.0
+        for ev in events:
+            t = float(ev["t"])
+            if t - prev > max_gap_ms:
+                shift += (t - prev) - max_gap_ms
+            prev = t
+            out.append(dict(ev, t=round(t - shift, 1)))
+        return out
+
     def run(self):
         t0 = time.perf_counter()
         self._log_reset()
-        self._log("开始回放: %d 个事件, 总时长 %.0f ms, 倍速 %.1fx"
-                  % (len(self.events), self.total_ms, self.speed))
+        self._log("开始回放: %d 个事件, 总时长 %.0f ms, 倍速 %.1fx%s"
+                  % (len(self.events), self.total_ms, self.speed,
+                     (", 已压缩长等待 %.1f 秒" % (self._compressed_ms / 1000.0)) if self._compressed_ms else ""))
         interrupted = True
         try:
             for i, ev in enumerate(self.events):
@@ -353,10 +375,16 @@ class SequencePlayer(threading.Thread):
         try:
             if it["type"] == "mouse":
                 _mouse.position = (int(it.get("x", 0)), int(it.get("y", 0)))
-                btn = MOUSE_BUTTONS.get(it.get("button", "left"), Button.left)
-                _mouse.press(btn)
-                self._sleep(duration)
-                _mouse.release(btn)
+                btn_name = it.get("button", "left")
+                if btn_name == "double":
+                    # 双击动作: 两次点击位置严格一致, 由系统判定为双击。
+                    # (用两个单击动作拼双击时, 位置差超过 4 像素系统就不认)
+                    _mouse.click(Button.left, 2)
+                else:
+                    btn = MOUSE_BUTTONS.get(btn_name, Button.left)
+                    _mouse.press(btn)
+                    self._sleep(duration)
+                    _mouse.release(btn)
             elif it["type"] == "key":
                 k = deserialize_key(it.get("key"))
                 if k:
@@ -384,14 +412,17 @@ class SequencePlayer(threading.Thread):
 
 # ---------- 单次输入执行(供连点器调用) ----------
 def perform_input(input_type, key_dict=None, mouse_button="left", fixed_pos=None):
-    """执行一次点击或按键. input_type: 'mouse' | 'key'"""
+    """执行一次点击或按键. input_type: 'mouse' | 'key'; mouse_button 可为 'double'"""
     try:
         if input_type == "mouse":
             if fixed_pos:
                 _mouse.position = (int(fixed_pos[0]), int(fixed_pos[1]))
-            btn = MOUSE_BUTTONS.get(mouse_button, Button.left)
-            _mouse.press(btn)
-            _mouse.release(btn)
+            if mouse_button == "double":
+                _mouse.click(Button.left, 2)
+            else:
+                btn = MOUSE_BUTTONS.get(mouse_button, Button.left)
+                _mouse.press(btn)
+                _mouse.release(btn)
         else:
             k = deserialize_key(key_dict)
             if k:

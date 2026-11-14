@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-main.py - 按键输入自动化工具 (KeyAuto)  v1.4
+main.py - 按键输入自动化工具 (KeyAuto)  v1.5
 交互形态: 主界面选择功能 -> 主界面隐藏 -> 悬浮窗设置并运行
-悬浮窗右键 -> 返回主界面 / 急停 / 保存配置 / 退出
+悬浮窗右键 -> 返回主界面 / 全局设置 / 急停 / 保存配置 / 退出
 
-v1.4 变更:
-  1. 键盘动作属性区不再显示 X/Y/鼠标按钮/点选定位(仅鼠标动作显示)
-  2. 添加鼠标动作可选 左/右/中键(空白圆菜单 + 工具栏菜单), 已有鼠标圆
-     右键可切换按钮
-  3. 修复屏幕点选 X/Y 的 DPI 坐标偏差: 覆盖层改发物理像素坐标, 与回放坐标系一致
-  4. 修复"关闭编辑器后悬浮窗消失": 关闭 quitOnLastWindowClosed, 关编辑器/对话框
-     不再连带退出整个程序
-  5. 修复"复现中途停止": 任务执行期间悬浮窗对鼠标透明(点击穿透), 模拟点击
-     不再误触悬浮窗自身按钮(如"停止回放")或被置顶悬浮窗挡住;
-     回放线程增加异常兜底与 data/replay.log 事件日志
+v1.5 变更:
+  1. 新增"鼠标双击"动作: 一次动作完成标准双击(两次点击位置严格一致)。
+     此前用两个单击拼双击, 点选位置差超过 4 像素时 Windows 不判定为双击,
+     导致"点两次打开文件"打不开
+  2. 回放新增"压缩长等待"(默认开启): 超过 2.5 秒的录制空闲缩短为 2.5 秒。
+     诊断确认: 回放从未中断, "暂停感"来自录制本身的长时间无操作
+  3. 热键提示三重保障: 悬浮窗右键新增"全局设置"入口(此前只有主界面有);
+     热键提示文字每 2 秒自动按当前设置刷新; 保存设置后立即刷新
 
+v1.4: 键盘动作属性去XY; 鼠标左/右/中键; DPI物理坐标; 关编辑器不退出程序;
+      悬浮窗鼠标穿透; replay.log 诊断日志
 v1.3: 连点仅跟随鼠标; 捕获框确定按钮; 鼠标点选XY; 热键提示刷新; 连点后台线程
 v1.2: 编辑器非模态化; 序列圆圈模式; 录制热键过滤
 v1.1: 全局浅色主题; 悬浮窗标题栏拖动; 高度自适应; 热键文字同步
@@ -78,7 +78,9 @@ DEFAULT_SETTINGS = {
     "hotkeys": {"record": "f6", "stop_record": "f7", "click": "f8", "panic": "f9"},
 }
 
-MOUSE_LABELS = [("left", "鼠标左键"), ("right", "鼠标右键"), ("middle", "鼠标中键")]
+MOUSE_LABELS = [("left", "鼠标左键"), ("right", "鼠标右键"),
+                ("middle", "鼠标中键"), ("double", "鼠标双击")]
+MOUSE_SHORT = {"left": "左键", "right": "右键", "middle": "中键", "double": "双击"}
 
 # ---------- 全局浅色主题: 显式指定前景/背景色, 不依赖系统深色模式 ----------
 GLOBAL_QSS = """
@@ -438,6 +440,10 @@ class ClickPanel(QWidget):
             if w is not None:
                 w.setMaximum(max(1, cap))
                 w.setValue(min(w.value(), cap))
+        self.refresh_hotkey_text()
+
+    def refresh_hotkey_text(self):
+        """按当前设置刷新按钮上的热键提示文字(供周期刷新调用)"""
         self.toggle_btn.setText(("停止 (%s)" if self.running else "启动 (%s)")
                                 % hk(self.ctx, "click", "F8"))
 
@@ -657,7 +663,7 @@ class SequenceEditorDialog(QDialog):
                 c = StepCircle(text, "key", i, self)
             else:
                 btn_name = it.get("button", "left")
-                short = {"left": "左键", "right": "右键", "middle": "中键"}.get(btn_name, btn_name)
+                short = MOUSE_SHORT.get(btn_name, btn_name)
                 c = StepCircle(short, "mouse", i, self)
             c.setToolTip("第 %d 个动作: %s" % (i + 1, self._item_desc(it)))
             c.apply_style(selected=(i == self._selected))
@@ -675,7 +681,8 @@ class SequenceEditorDialog(QDialog):
             return "键盘 %s, 按住 %.2fs, 延时 %.2fs" % (
                 core.key_display_name(it.get("key")), it.get("duration", 0.05), it.get("delay", 0))
         return "鼠标 %s @(%d,%d), 按住 %.2fs, 延时 %.2fs" % (
-            it.get("button", "left"), it.get("x", 0), it.get("y", 0),
+            MOUSE_SHORT.get(it.get("button", "left"), it.get("button")),
+            it.get("x", 0), it.get("y", 0),
             it.get("duration", 0.05), it.get("delay", 0))
 
     # ---------- 选择 / 增删移 ----------
@@ -707,7 +714,7 @@ class SequenceEditorDialog(QDialog):
         act_key = m.addAction("键盘按键 (弹窗捕获)")
         m.addSeparator()
         for code, label in MOUSE_LABELS:
-            m.addAction("添加鼠标 %s 动作" % label).setData(code)
+            m.addAction("添加 %s 动作" % label).setData(code)
         chosen = m.exec(QCursor.pos())
         if chosen is None:
             return
@@ -1086,6 +1093,12 @@ class RecordPanel(QWidget):
             self.speed_combo.addItem(label, s)
         self.speed_combo.setCurrentIndex(1)
         speed_row.addWidget(self.speed_combo)
+        # 压缩长等待: 录制中超过 2.5 秒的空闲在回放时缩短为 2.5 秒,
+        # 否则录制时的发呆时间会让回放看起来"卡住/暂停"
+        self.compress_chk = QCheckBox("压缩长等待")
+        self.compress_chk.setChecked(True)
+        self.compress_chk.setToolTip("回放时把超过 2.5 秒的空闲等待缩短为 2.5 秒\n(例: 录制里点完窗口后 7 秒没动, 回放只等 2.5 秒)")
+        speed_row.addWidget(self.compress_chk)
         speed_row.addStretch(1)
         self.play_btn = QPushButton("回放")
         self.play_btn.clicked.connect(self._play)
@@ -1103,6 +1116,10 @@ class RecordPanel(QWidget):
     def refresh_labels(self):
         if self.recorder and self.recorder.recording:
             self.rec_btn.setText("结束录制 (%s)" % hk(self.ctx, "record", "F6"))
+            # 录制中的状态行提示也随热键设置更新
+            if self.status.text().startswith("●"):
+                self.status.setText("● 录制中… (热键 %s/%s 不录入)"
+                                    % (hk(self.ctx, "record", "F6"), hk(self.ctx, "stop_record", "F7")))
         else:
             self.rec_btn.setText("开始录制 (%s)" % hk(self.ctx, "record", "F6"))
 
@@ -1171,6 +1188,7 @@ class RecordPanel(QWidget):
             QMessageBox.warning(self, "提示", "该录制文件为空")
             return
         speed = self.speed_combo.currentData()
+        max_gap = 2500 if self.compress_chk.isChecked() else None
         self.play_btn.setText("停止回放")
         self.status.setText("▶ 回放中…")
         # 回放期间悬浮窗鼠标穿透, 模拟点击不会点中悬浮窗自身按钮(如"停止回放")
@@ -1178,7 +1196,8 @@ class RecordPanel(QWidget):
         self.ctx.notify("回放已开始 (倍速 %.1fx, 急停 %s 可停)" % (speed, hk(self.ctx, "panic", "F9")))
         self.progress_timer.start(100)
 
-        self.replayer = Replayer(events, speed=speed, on_done=self.playback_done.emit)
+        self.replayer = Replayer(events, speed=speed, on_done=self.playback_done.emit,
+                                 max_gap_ms=max_gap)
         self.replayer.start()
 
     def _on_play_done(self, interrupted):
@@ -1307,6 +1326,7 @@ class FloatingWindow(QWidget):
     def show_menu(self, pos):
         m = QMenu(self)
         act_back = m.addAction("返回主界面(切换功能)")
+        act_settings = m.addAction("全局设置(热键/频率等)")
         m.addSeparator()
         act_panic = m.addAction("急停(停止所有任务)")
         act_save = m.addAction("保存当前配置")
@@ -1315,6 +1335,8 @@ class FloatingWindow(QWidget):
         chosen = m.exec(pos)
         if chosen == act_back:
             self.ctx.back_to_main()
+        elif chosen == act_settings:
+            self.ctx.open_settings(self)
         elif chosen == act_panic:
             self.ctx.panic_stop()
         elif chosen == act_save:
@@ -1416,11 +1438,7 @@ class MainWindow(QMainWindow):
                              h["click"].upper(), h["panic"].upper()))
 
     def _open_settings(self):
-        dlg = SettingsDialog(self, self.ctx.settings)
-        if dlg.exec() == QDialog.Accepted:
-            self.ctx.settings = dlg.values
-            save_settings(self.ctx.settings)
-            self.ctx.on_settings_changed()
+        self.ctx.open_settings(self)
 
 
 class SettingsDialog(QDialog):
@@ -1494,6 +1512,27 @@ class AppContext:
         self._notify_timer = None
         self.hotkeys.fired.connect(self._on_hotkey)
         self.hotkeys.start(self.settings["hotkeys"])
+        # 热键提示文字周期自动刷新(每 2 秒): 无论设置从哪条路径被修改,
+        # 界面上所有括号里的热键提示都会跟着当前设置走, 杜绝任何"提示过期"
+        self._hotkey_timer = QTimer()
+        self._hotkey_timer.setInterval(2000)
+        self._hotkey_timer.timeout.connect(self.refresh_hotkey_texts)
+        self._hotkey_timer.start()
+
+    def open_settings(self, parent):
+        """打开全局设置(主界面与悬浮窗右键菜单共用同一入口)"""
+        dlg = SettingsDialog(parent, self.settings)
+        if dlg.exec() == QDialog.Accepted:
+            self.settings = dlg.values
+            save_settings(self.settings)
+            self.on_settings_changed()
+
+    def refresh_hotkey_texts(self):
+        """只刷新热键提示文字(不碰其他控件值, 可高频调用)"""
+        self.floating.panel_rec.refresh_labels()
+        for p in (self.floating.panel_fixed, self.floating.panel_random):
+            p.refresh_hotkey_text()
+        self.main.refresh_info()
 
     def on_settings_changed(self):
         self.floating.apply_style()
@@ -1599,6 +1638,19 @@ def main():
         assert "x" not in ed.items[1]
         pseq._write_prop("duration", 0.2)
         assert ed.items[1]["duration"] == 0.2
+        # 双击动作: 可添加/可切换, 属性下拉能选中
+        ed.append_item({"type": "mouse", "button": "double", "x": 5, "y": 5,
+                        "duration": 0.05, "delay": 0})
+        ed.select(2)
+        assert pseq.prop_btn_combo.currentText() == "鼠标双击"
+        ed.set_button(2, "left")
+        assert ed.items[2]["button"] == "left"
+        # 回放时间轴压缩: 超过 2.5s 的间隔被压缩, 短间隔原样保留
+        evs = [{"t": 100, "type": "a"}, {"t": 300, "type": "b"},
+               {"t": 9300, "type": "c"}, {"t": 9800, "type": "d"}]
+        comp = Replayer.compress_timeline(evs, 2500)
+        assert comp[0]["t"] == 100 and comp[1]["t"] == 300
+        assert comp[2]["t"] == 2800 and comp[3]["t"] == 3300
         # 关闭编辑器: 程序不得退出, 悬浮窗保持可见
         ed.close()
         app.processEvents()
@@ -1615,6 +1667,9 @@ def main():
         assert "F3" in ctx.floating.panel_fixed.toggle_btn.text(), ctx.floating.panel_fixed.toggle_btn.text()
         ctx.floating.show_panel(3)
         assert "F8" in ctx.floating.panel_rec.rec_btn.text()
+        # 热键提示周期刷新链路可调用(主界面提示行同步)
+        ctx.refresh_hotkey_texts()
+        assert "F8" in ctx.main.info.text() or "F8" in ctx.floating.panel_rec.rec_btn.text()
         # 回放器: 日志落盘 + 线程级异常兜底(用空事件类型, 不产生真实键鼠注入)
         rp = Replayer([{"t": 5, "type": "_test_noop"}], speed=10, on_done=lambda i: None)
         rp.start()
