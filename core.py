@@ -7,6 +7,7 @@ core.py - 按键输入自动化工具核心引擎
 import json
 import time
 import random
+import ctypes
 import threading
 from pathlib import Path
 
@@ -437,6 +438,45 @@ def random_interval_ms(lo, hi, jitter=0.12):
     rate = random.randint(int(lo), int(hi))
     base = 1000.0 / max(1, rate)
     return base * random.uniform(1 - jitter, 1 + jitter)
+
+
+# ---------- Windows 前台窗口工具 ----------
+# 模拟键鼠输入(SendInput)只发给"前台窗口"; 全屏游戏只有处于前台时才响应输入。
+# 任务启动前若焦点被悬浮窗/其他程序抢走, 需要把焦点还给目标程序。
+def _user32():
+    return ctypes.windll.user32
+
+
+def get_foreground_hwnd():
+    """当前前台窗口句柄, 失败返回 0"""
+    try:
+        return int(_user32().GetForegroundWindow())
+    except Exception:
+        return 0
+
+
+def hwnd_pid(hwnd):
+    """窗口所属进程 PID"""
+    try:
+        pid = ctypes.c_ulong()
+        _user32().GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:
+        return 0
+
+
+def set_foreground_hwnd(hwnd):
+    """把窗口带回前台(最小化时先恢复)。"""
+    try:
+        u = _user32()
+        if hwnd:
+            if u.IsIconic(int(hwnd)):
+                u.ShowWindow(int(hwnd), 9)  # SW_RESTORE
+            u.SetForegroundWindow(int(hwnd))
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # ---------- JSON 读写 ----------

@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-main.py - 按键输入自动化工具 (KeyAuto)  v1.5
+main.py - 按键输入自动化工具 (KeyAuto)  v1.6
 交互形态: 主界面选择功能 -> 主界面隐藏 -> 悬浮窗设置并运行
 悬浮窗右键 -> 返回主界面 / 全局设置 / 急停 / 保存配置 / 退出
 
-v1.5 变更:
-  1. 新增"鼠标双击"动作: 一次动作完成标准双击(两次点击位置严格一致)。
-     此前用两个单击拼双击, 点选位置差超过 4 像素时 Windows 不判定为双击,
-     导致"点两次打开文件"打不开
-  2. 回放新增"压缩长等待"(默认开启): 超过 2.5 秒的录制空闲缩短为 2.5 秒。
-     诊断确认: 回放从未中断, "暂停感"来自录制本身的长时间无操作
-  3. 热键提示三重保障: 悬浮窗右键新增"全局设置"入口(此前只有主界面有);
-     热键提示文字每 2 秒自动按当前设置刷新; 保存设置后立即刷新
+v1.6 变更(全屏程序/游戏支持):
+  1. 焦点自动归还: 模拟键鼠只发给"前台窗口", 全屏游戏失焦时会忽略全部输入。
+     程序持续追踪上一个前台窗口, 回放/序列/连点启动后自动把焦点还给它
+  2. 新增全局热键: 回放启停(默认 F10)、序列启停(默认 F12)——
+     全屏游戏下不用点悬浮窗按钮, 焦点保持在游戏上直接热键启停
+  3. 旧设置文件自动补全新热键默认值
 
+v1.5: 鼠标双击动作; 回放压缩长等待; 悬浮窗全局设置入口; 热键提示周期刷新
 v1.4: 键盘动作属性去XY; 鼠标左/右/中键; DPI物理坐标; 关编辑器不退出程序;
       悬浮窗鼠标穿透; replay.log 诊断日志
 v1.3: 连点仅跟随鼠标; 捕获框确定按钮; 鼠标点选XY; 热键提示刷新; 连点后台线程
@@ -20,6 +19,7 @@ v1.2: 编辑器非模态化; 序列圆圈模式; 录制热键过滤
 v1.1: 全局浅色主题; 悬浮窗标题栏拖动; 高度自适应; 热键文字同步
 """
 import sys
+import os
 import time
 import json
 import threading
@@ -75,7 +75,8 @@ DEFAULT_SETTINGS = {
     "rate_cap": 10,
     "opacity": 0.92,
     "sound": True,
-    "hotkeys": {"record": "f6", "stop_record": "f7", "click": "f8", "panic": "f9"},
+    "hotkeys": {"record": "f6", "stop_record": "f7", "click": "f8", "panic": "f9",
+                "play": "f10", "seq": "f12"},
 }
 
 MOUSE_LABELS = [("left", "鼠标左键"), ("right", "鼠标右键"),
@@ -120,6 +121,10 @@ def load_settings():
     s = core.load_json(CONFIG_FILE, DEFAULT_SETTINGS)
     for k, v in DEFAULT_SETTINGS.items():
         s.setdefault(k, v)
+    # 旧设置文件缺少新增热键(play/seq)时补默认值
+    if isinstance(s.get("hotkeys"), dict):
+        for k2, v2 in DEFAULT_SETTINGS["hotkeys"].items():
+            s["hotkeys"].setdefault(k2, v2)
     return s
 
 
@@ -489,6 +494,8 @@ class ClickPanel(QWidget):
         self.clicker.start()
         # 连点期间悬浮窗鼠标穿透, 防止点击打在悬浮窗上
         self.ctx.floating.set_input_pass_through(True)
+        # 把键盘焦点还给上一个前台程序(全屏游戏失焦时会忽略全部模拟输入)
+        self.ctx.restore_foreground()
         self.ctx.notify("连点任务已启动(跟随鼠标)")
 
     def stop(self):
@@ -892,7 +899,7 @@ class SequencePanel(QWidget):
         self.prop_btn_combo.currentIndexChanged.connect(
             lambda i: self._write_prop("button", MOUSE_LABELS[i][0]))
 
-        self.toggle_btn = QPushButton("执行")
+        self.toggle_btn = QPushButton("执行 (F12)")
         self.toggle_btn.setMinimumHeight(36)
         self.toggle_btn.setStyleSheet(
             "QPushButton{background:#2e7d32;color:#ffffff;border:none;border-radius:6px;font-weight:bold;font-size:13px;}"
@@ -1033,6 +1040,8 @@ class SequencePanel(QWidget):
             self.status.setText("执行中…")
             # 执行期间悬浮窗鼠标穿透: 模拟点击不会误触自身按钮, 也不会挡住目标位置
             self.ctx.floating.set_input_pass_through(True)
+            # 把键盘焦点还给上一个前台程序(全屏游戏失焦时会忽略全部模拟输入)
+            self.ctx.restore_foreground()
             self.ctx.notify("序列执行已启动")
 
             self.player = SequencePlayer(items, loops=loops, on_done=self.playback_done.emit)
@@ -1041,9 +1050,14 @@ class SequencePanel(QWidget):
     def _on_play_done(self, interrupted):
         self.player = None
         self.toggle_btn.setChecked(False)
-        self.toggle_btn.setText("执行")
+        self.toggle_btn.setText("执行 (%s)" % hk(self.ctx, "seq", "F12"))
         self.status.setText("已中断" if interrupted else "完成")
         self.ctx.floating.set_input_pass_through(False)
+
+    def refresh_hotkey_text(self):
+        self.toggle_btn.setText(
+            "停止" if (self.player and not self.player.stopped)
+            else "执行 (%s)" % hk(self.ctx, "seq", "F12"))
 
     def stop(self):
         if self.player:
@@ -1122,6 +1136,9 @@ class RecordPanel(QWidget):
                                     % (hk(self.ctx, "record", "F6"), hk(self.ctx, "stop_record", "F7")))
         else:
             self.rec_btn.setText("开始录制 (%s)" % hk(self.ctx, "record", "F6"))
+        self.play_btn.setText(
+            "停止回放" if (self.replayer and not self.replayer.stopped)
+            else "回放 (%s)" % hk(self.ctx, "play", "F10"))
 
     def reload(self):
         self.file_combo.clear()
@@ -1193,6 +1210,8 @@ class RecordPanel(QWidget):
         self.status.setText("▶ 回放中…")
         # 回放期间悬浮窗鼠标穿透, 模拟点击不会点中悬浮窗自身按钮(如"停止回放")
         self.ctx.floating.set_input_pass_through(True)
+        # 把键盘焦点还给上一个前台程序(全屏游戏失焦时会忽略全部模拟输入)
+        self.ctx.restore_foreground()
         self.ctx.notify("回放已开始 (倍速 %.1fx, 急停 %s 可停)" % (speed, hk(self.ctx, "panic", "F9")))
         self.progress_timer.start(100)
 
@@ -1203,7 +1222,7 @@ class RecordPanel(QWidget):
     def _on_play_done(self, interrupted):
         self.progress_timer.stop()
         self.replayer = None
-        self.play_btn.setText("回放")
+        self.play_btn.setText("回放 (%s)" % hk(self.ctx, "play", "F10"))
         self.status.setText("已中断" if interrupted else "回放完成")
         self.ctx.floating.set_input_pass_through(False)
         if interrupted:
@@ -1433,9 +1452,10 @@ class MainWindow(QMainWindow):
 
     def refresh_info(self):
         h = self.ctx.settings["hotkeys"]
-        self.info.setText("热键: %s 录制 · %s 结束录制 · %s 连点启停 · %s 急停 (可在全局设置中修改)"
-                          % (h["record"].upper(), h["stop_record"].upper(),
-                             h["click"].upper(), h["panic"].upper()))
+        self.info.setText("热键: %s 录制 · %s 结束 · %s 连点 · %s 回放 · %s 序列 · %s 急停 (可在全局设置中修改)"
+                          % (h.get("record", "f6").upper(), h.get("stop_record", "f7").upper(),
+                             h.get("click", "f8").upper(), h.get("play", "f10").upper(),
+                             h.get("seq", "f12").upper(), h.get("panic", "f9").upper()))
 
     def _open_settings(self):
         self.ctx.open_settings(self)
@@ -1470,14 +1490,16 @@ class SettingsDialog(QDialog):
         lay.addWidget(self.sound, 2, 1)
 
         hotkey_labels = [("录制开始", "record"), ("录制结束", "stop_record"),
-                         ("连点启停", "click"), ("急停", "panic")]
+                         ("连点启停", "click"), ("回放启停", "play"),
+                         ("序列启停", "seq"), ("急停", "panic")]
+        default_hks = DEFAULT_SETTINGS["hotkeys"]
         self.hk_combos = {}
         key_names = ["f%d" % i for i in range(1, 13)]
         for i, (label, key) in enumerate(hotkey_labels):
             lay.addWidget(QLabel("%s:" % label), 3 + i, 0)
             combo = QComboBox()
             combo.addItems(key_names)
-            combo.setCurrentText(settings.get("hotkeys", {}).get(key, "f%d" % (6 + i)))
+            combo.setCurrentText(settings.get("hotkeys", {}).get(key, default_hks.get(key, "f6")))
             lay.addWidget(combo, 3 + i, 1)
             self.hk_combos[key] = combo
 
@@ -1518,6 +1540,26 @@ class AppContext:
         self._hotkey_timer.setInterval(2000)
         self._hotkey_timer.timeout.connect(self.refresh_hotkey_texts)
         self._hotkey_timer.start()
+        # 前台窗口追踪: 记住"上一个不属于本程序的前台窗口"。
+        # 模拟键鼠只发给前台窗口, 全屏游戏失焦时会忽略所有输入——
+        # 任务启动后把焦点还给它, 游戏才能响应回放/连点/序列
+        self._last_fg = 0
+        self._fg_timer = QTimer()
+        self._fg_timer.setInterval(400)
+        self._fg_timer.timeout.connect(self._poll_foreground)
+        self._fg_timer.start()
+
+    def _poll_foreground(self):
+        hwnd = core.get_foreground_hwnd()
+        if hwnd and core.hwnd_pid(hwnd) != os.getpid():
+            self._last_fg = hwnd
+
+    def restore_foreground(self, delay_ms=250):
+        """任务启动后把键盘焦点还给上一个前台程序(全屏游戏必须聚焦才接受模拟输入)"""
+        hwnd = self._last_fg
+        if not hwnd:
+            return
+        QTimer.singleShot(delay_ms, lambda: core.set_foreground_hwnd(hwnd))
 
     def open_settings(self, parent):
         """打开全局设置(主界面与悬浮窗右键菜单共用同一入口)"""
@@ -1532,6 +1574,7 @@ class AppContext:
         self.floating.panel_rec.refresh_labels()
         for p in (self.floating.panel_fixed, self.floating.panel_random):
             p.refresh_hotkey_text()
+        self.floating.panel_seq.refresh_hotkey_text()
         self.main.refresh_info()
 
     def on_settings_changed(self):
@@ -1600,6 +1643,13 @@ class AppContext:
         elif action == "stop_record":
             if self.floating.panel_rec.recorder and self.floating.panel_rec.recorder.recording:
                 self.floating.panel_rec.stop_record()
+        elif action == "play":
+            # 全屏游戏场景: 焦点保持在游戏上, 用热键启停回放, 无需点击悬浮窗
+            if self.floating.stack.currentIndex() == 3:
+                self.floating.panel_rec._play()
+        elif action == "seq":
+            if self.floating.stack.currentIndex() == 2:
+                self.floating.panel_seq._toggle()
 
 
 def main():
@@ -1670,6 +1720,13 @@ def main():
         # 热键提示周期刷新链路可调用(主界面提示行同步)
         ctx.refresh_hotkey_texts()
         assert "F8" in ctx.main.info.text() or "F8" in ctx.floating.panel_rec.rec_btn.text()
+        # v1.6: 新热键默认值、前台窗口追踪、回放/序列按钮热键提示
+        assert "play" in ctx.settings["hotkeys"] and "seq" in ctx.settings["hotkeys"]
+        ctx._poll_foreground()  # 只读系统前台窗口
+        ctx.refresh_hotkey_texts()
+        assert "F10" in ctx.floating.panel_rec.play_btn.text(), ctx.floating.panel_rec.play_btn.text()
+        assert "F12" in ctx.floating.panel_seq.toggle_btn.text(), ctx.floating.panel_seq.toggle_btn.text()
+        assert hasattr(ctx, "restore_foreground")
         # 回放器: 日志落盘 + 线程级异常兜底(用空事件类型, 不产生真实键鼠注入)
         rp = Replayer([{"t": 5, "type": "_test_noop"}], speed=10, on_done=lambda i: None)
         rp.start()
